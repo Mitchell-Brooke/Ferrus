@@ -35,6 +35,43 @@ pub struct ImageManifest {
     /// persistence support can't be determined.
     #[serde(default)]
     pub linux_flavor: Option<String>,
+    /// Does the source ISO carry MBR boot code (sector-copyable)?
+    /// Filled in by the caller that has the raw file; tree scans leave
+    /// it false.
+    #[serde(default)]
+    pub hybrid: bool,
+    /// Relative directory (from the ISO root) holding a SYSLINUX/
+    /// ISOLINUX configuration file, if any — the prerequisite for
+    /// extraction plans to produce a BIOS-bootable stick.
+    #[serde(default)]
+    pub syslinux_dir: Option<String>,
+}
+
+/// Directories SYSLINUX-family loaders conventionally live in, searched
+/// in preference order.
+const SYSLINUX_DIRS: [&str; 5] = [
+    "isolinux",
+    "boot/syslinux",
+    "syslinux",
+    "boot/isolinux",
+    "images", // some Debian media keep cfg here
+];
+
+/// Find a SYSLINUX/ISOLINUX config file under `root`, returning the
+/// containing directory relative to `root`.
+fn find_syslinux_cfg(root: &Path) -> Option<String> {
+    for dir in SYSLINUX_DIRS {
+        let d = root.join(dir);
+        if !d.is_dir() {
+            continue;
+        }
+        for cfg in ["syslinux.cfg", "isolinux.cfg"] {
+            if d.join(cfg).is_file() {
+                return Some(dir.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Case-insensitive child lookup — ISO9660 trees frequently arrive uppercase.
@@ -104,6 +141,7 @@ pub fn scan_tree(root: &Path) -> std::io::Result<ImageManifest> {
     walk(root, root, &mut m)?;
     m.is_windows = looks_like_windows(root);
     m.linux_flavor = detect_linux_flavor(root);
+    m.syslinux_dir = find_syslinux_cfg(root);
     Ok(m)
 }
 
@@ -147,6 +185,20 @@ pub fn have_wimlib() -> bool {
         let c = dir.join("wimlib-imagex");
         c.is_file()
     })
+}
+
+/// Does the ISO carry x86 boot code in its system area (sector 0)?
+/// Hybrid ISOs (isohybrid / xorriso `-isohybrid-mbr`) place an MBR there;
+/// pure ISO9660 images leave the 32 KiB system area zeroed, so a
+/// sector-copy would produce an unbootable stick.
+pub fn is_hybrid(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut sector = [0u8; 512];
+    f.read_exact(&mut sector)?;
+    // A handful of stray nonzero bytes are tolerated; real boot code is
+    // dense. Rufus applies the same "more than N bytes" heuristic.
+    Ok(sector.iter().filter(|&&b| b != 0).count() > 64)
 }
 
 /// Edition names inside a Windows ISO's install.wim/esd.
@@ -236,12 +288,32 @@ fn parse_wim_info(text: &str) -> Vec<(u32, String)> {
     images
 }
 
+/// Is the SYSLINUX BIOS installer on PATH? Gates extraction plans.
+pub fn have_syslinux() -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    std::env::split_paths(&path).any(|dir| dir.join("syslinux").is_file())
+}
+
 /// Map a manifest onto a concrete flashing plan (Rufus's auto behaviour).
 pub fn choose_plan(m: &ImageManifest, image: &Path) -> FlashPlan {
     use crate::protocol::{PartitionScheme, WinOptions};
     let img = || image.to_string_lossy().into_owned();
 
     if !m.is_windows {
+        // Non-hybrid ISO: sector-copying would yield an unbootable stick
+        // (no MBR boot code), so extract onto FAT32 + install SYSLINUX
+        // instead — but only when a loader config exists to install for
+        // and the installer is available.
+        if !m.hybrid && m.syslinux_dir.is_some() && have_syslinux() {
+            return FlashPlan::IsoExtract {
+                image: img(),
+                scheme: PartitionScheme::Mbr,
+                syslinux_bios: true,
+            };
+        }
         return FlashPlan::RawDd {
             image: img(),
             verify: true,
@@ -304,14 +376,15 @@ mod tests {
     }
 
     #[test]
-    fn linux_iso_detected_and_dd_planned() {
+    fn linux_hybrid_iso_detected_and_dd_planned() {
         let base = std::env::temp_dir().join("ferrus-test-linux");
         std::fs::remove_dir_all(&base).ok();
         linux_tree(&base);
 
-        let m = scan_tree(&base).unwrap();
+        let mut m = scan_tree(&base).unwrap();
         assert!(!m.is_windows);
         assert_eq!(m.total_size, (8 << 20) + 4096);
+        m.hybrid = true; // sector-copyable image
         let plan = choose_plan(&m, Path::new("/tmp/l.iso"));
         assert_eq!(
             plan,
@@ -322,6 +395,41 @@ mod tests {
                 persistence_label: None
             }
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn nonhybrid_linux_iso_uses_extract_when_syslinux_present() {
+        let base = std::env::temp_dir().join("ferrus-test-linux-nonhybrid");
+        std::fs::remove_dir_all(&base).ok();
+        linux_tree(&base);
+
+        // No SYSLINUX config in the tree: extraction is impossible, so
+        // even a non-hybrid image falls back to raw DD.
+        let m = scan_tree(&base).unwrap();
+        assert!(m.syslinux_dir.is_none());
+        let plan = choose_plan(&m, Path::new("/tmp/l.iso"));
+        assert!(matches!(plan, FlashPlan::RawDd { .. }));
+
+        // With isolinux/isolinux.cfg present the extract plan applies
+        // (when the syslinux installer exists on this machine).
+        std::fs::create_dir_all(base.join("isolinux")).unwrap();
+        std::fs::write(
+            base.join("isolinux/isolinux.cfg"),
+            "DEFAULT linux\nLABEL linux\nKERNEL /boot/vmlinuz\n",
+        )
+        .unwrap();
+        let m = scan_tree(&base).unwrap();
+        assert_eq!(m.syslinux_dir.as_deref(), Some("isolinux"));
+        let plan = choose_plan(&m, Path::new("/tmp/l.iso"));
+        if have_syslinux() {
+            assert!(matches!(
+                plan,
+                FlashPlan::IsoExtract { syslinux_bios: true, .. }
+            ));
+        } else {
+            assert!(matches!(plan, FlashPlan::RawDd { .. }));
+        }
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -412,6 +520,40 @@ mod tests {
             }
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn hybrid_sector0_detection() {
+        use std::io::Write;
+        let p = std::env::temp_dir().join("ferrus-test-hybrid.bin");
+
+        // Zeroed system area -> not hybrid.
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&[0u8; 2048]).unwrap();
+        drop(f);
+        assert!(!is_hybrid(&p).unwrap());
+
+        // Dense x86 boot code (isohybrid MBR) -> hybrid.
+        let mut code = [0u8; 512];
+        for (i, b) in code.iter_mut().enumerate() {
+            *b = if i < 440 { (i % 251) as u8 } else { 0 };
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.write_all(&code).unwrap();
+        drop(f);
+        assert!(is_hybrid(&p).unwrap());
+
+        // Sparse noise below the threshold -> still treated as non-hybrid.
+        let mut sparse = [0u8; 512];
+        for b in sparse.iter_mut().take(32) {
+            *b = 0xAA;
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.write_all(&sparse).unwrap();
+        drop(f);
+        assert!(!is_hybrid(&p).unwrap());
+
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

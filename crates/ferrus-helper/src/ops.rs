@@ -876,9 +876,15 @@ pub fn copy_tree(
 
 /// Loop-mount `image` read-only and classify its contents.
 pub fn probe_manifest(image: &Path) -> anyhow::Result<ImageManifest> {
-    let mnt = Mount::ro(image)?;
-    let manifest = iso::scan_tree(mnt.path()).context("scanning mounted image")?;
-    mnt.unmount()?;
+    let mut manifest = {
+        let mnt = Mount::ro(image)?;
+        let m = iso::scan_tree(mnt.path()).context("scanning mounted image")?;
+        mnt.unmount()?;
+        m
+    };
+    // Tree scans can't see the system area; only the raw file can tell
+    // whether a sector copy would boot.
+    manifest.hybrid = iso::is_hybrid(image).unwrap_or(true);
     Ok(manifest)
 }
 
@@ -1122,6 +1128,82 @@ pub fn execute_plan(
             Ok(format!("Windows USB ready (UEFI:NTFS, {})", scheme.describe()))
         }
 
+        FlashPlan::IsoExtract {
+            mut scheme,
+            syslinux_bios,
+            ..
+        } => {
+            let image = PathBuf::from(plan.image_path().context("image missing")?);
+            // BIOS booting via SYSLINUX needs a legacy MBR table (the
+            // stock mbr.bin chainloads the active partition; GPT has none).
+            let bios = *syslinux_bios;
+            if bios && scheme == PartitionScheme::Gpt {
+                progress_tick(send, "forcing MBR (SYSLINUX BIOS requirement)");
+                scheme = PartitionScheme::Mbr;
+            }
+
+            release_partitions(dev);
+            progress_tick(send, "partitioning");
+            wipe_signatures(dev)?;
+            let mut p_live = data_part("LIVE", None, false);
+            p_live.mbr_type = "0c";
+            p_live.mbr_boot = bios;
+            partition(dev, scheme, &[p_live])?;
+            reread_partitions(dev);
+            let p1 = part_node(dev, 1);
+            wait_for_node(&p1, 10)?;
+
+            progress_tick(send, "formatting");
+            mkfs_any("FAT32", "LIVE", &p1, None)?;
+
+            progress_tick(send, "mounting");
+            let iso_mnt = Mount::ro(&image)?;
+            let tgt = Mount::rw(&p1)?;
+
+            progress_tick(send, "copying files");
+            copy_tree(
+                iso_mnt.path(),
+                tgt.path(),
+                None,
+                false,
+                cancel,
+                pids,
+                &mut |d, t, ph| {
+                    send(Response::Progress {
+                        done: d,
+                        total: t,
+                        verifying: false,
+                        phase: Some(ph.into()),
+                    });
+                },
+            )?;
+
+            // While still mounted: pick the bootloader directory, drop in
+            // ldlinux.c32 and make sure a syslinux.cfg-named config exists.
+            let loader_dir = if bios {
+                Some(prep_syslinux_tree(tgt.path())?)
+            } else {
+                None
+            };
+
+            tgt.unmount()?;
+            iso_mnt.unmount()?;
+
+            if let Some(dir) = loader_dir {
+                progress_tick(send, "installing SYSLINUX");
+                // Bootsector patcher wants the volume unmounted.
+                run("syslinux", &["-i", "-d", &dir, &p1.to_string_lossy()], None)
+                    .context("syslinux bootsector install")?;
+                write_mbr_code(dev, &locate_syslinux_files()?.1)?;
+            }
+            sync_dev(dev);
+            Ok(format!(
+                "Linux USB ready (extracted{}, {})",
+                if bios { " + SYSLINUX" } else { "" },
+                scheme.describe()
+            ))
+        }
+
         FlashPlan::WinToGo {
             wim_index,
             scheme,
@@ -1284,6 +1366,108 @@ fn locate_install_wim(iso_root: &Path) -> anyhow::Result<PathBuf> {
         }
     }
     bail!("no sources/install.wim or install.esd in this image")
+}
+
+// ------------------------------------------------- SYSLINUX (extract plans)
+
+/// `(ldlinux.c32, mbr.bin)` for BIOS installs, across distro layouts.
+fn locate_syslinux_files() -> anyhow::Result<(PathBuf, PathBuf)> {
+    const DIRS: [&str; 4] = [
+        "/usr/lib/syslinux/bios",      // Arch
+        "/usr/lib/syslinux/modules/bios", // Debian syslinux-common
+        "/usr/share/syslinux",         // upstream / Fedora
+        "/usr/lib/SYSLINUX",           // older Debian
+    ];
+    let mut ldlinux = None;
+    let mut mbr = None;
+    for d in DIRS {
+        if ldlinux.is_none() {
+            let p = PathBuf::from(d).join("ldlinux.c32");
+            if p.is_file() {
+                ldlinux = Some(p);
+            }
+        }
+        if mbr.is_none() {
+            for name in ["mbr.bin", "mbr_br.bin"] {
+                let p = PathBuf::from(d).join(name);
+                if p.is_file() {
+                    mbr = Some(p);
+                    break;
+                }
+            }
+        }
+    }
+    match (ldlinux, mbr) {
+        (Some(l), Some(m)) => Ok((l, m)),
+        (l, m) => bail!(
+            "syslinux files missing (ldlinux.c32: {}, mbr.bin: {}); \
+             install the syslinux package",
+            l.is_some(),
+            m.is_some()
+        ),
+    }
+}
+
+/// Pick the bootloader directory inside the extracted tree, drop
+/// `ldlinux.c32` into it and make sure a file named `syslinux.cfg` exists
+/// (SYSLINUX looks for that name; ISOLINUX media ship `isolinux.cfg`).
+/// Returns the directory path in the form the `-d` option expects.
+fn prep_syslinux_tree(root: &Path) -> anyhow::Result<String> {
+    use std::path::PathBuf;
+
+    // Preference order mirrors what real ISOs ship.
+    let candidates = ["isolinux", "boot/syslinux", "syslinux", "boot/isolinux"];
+    let mut chosen: Option<PathBuf> = None;
+    for c in candidates {
+        let dir = root.join(c);
+        if dir.is_dir() {
+            chosen = Some(dir);
+            break;
+        }
+    }
+    let dir = match chosen {
+        Some(d) => d,
+        None => {
+            // No loader directory at all: create a minimal one so at least
+            // the bootsector is functional.
+            let d = root.join("isolinux");
+            std::fs::create_dir_all(&d).context("creating isolinux dir")?;
+            d
+        }
+    };
+
+    let (ldlinux_c32, _) = locate_syslinux_files()?;
+    std::fs::copy(&ldlinux_c32, dir.join("ldlinux.c32"))
+        .with_context(|| format!("copying {}", ldlinux_c32.display()))?;
+
+    if !dir.join("syslinux.cfg").exists() {
+        if dir.join("isolinux.cfg").exists() {
+            std::fs::copy(dir.join("isolinux.cfg"), dir.join("syslinux.cfg"))
+                .context("duplicating isolinux.cfg as syslinux.cfg")?;
+        } else {
+            bail!(
+                "no isolinux.cfg/syslinux.cfg under {} — cannot make this ISO BIOS-bootable",
+                dir.display()
+            );
+        }
+    }
+
+    let rel = dir.strip_prefix(root).unwrap_or(&dir);
+    Ok(format!("/{}", rel.to_string_lossy()))
+}
+
+/// Write SYSLINUX's MBR stub (first 440 bytes of code area).
+fn write_mbr_code(dev: &Path, mbr_bin: &Path) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let code = std::fs::read(mbr_bin).context("reading mbr.bin")?;
+    anyhow::ensure!(code.len() >= 440, "mbr.bin too small ({})", code.len());
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dev)
+        .with_context(|| format!("opening {} for MBR write", dev.display()))?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&code[..440]).context("writing MBR boot code")?;
+    Ok(())
 }
 
 /// Run `wimlib-imagex apply`, proxying coarse progress. `index` follows the

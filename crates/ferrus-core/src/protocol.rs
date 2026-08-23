@@ -57,6 +57,10 @@ impl WinOptions {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// How a bootable USB stick is laid out for a given image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -110,6 +114,18 @@ pub enum FlashPlan {
         scheme: PartitionScheme,
         #[serde(default)]
         options: WinOptions,
+    },
+    /// Non-hybrid Linux ISO: Rufus-style extraction. The ISO tree is copied
+    /// onto a single FAT32 partition instead of being sector-copied, and
+    /// SYSLINUX is installed for BIOS booting (UEFI machines boot from the
+    /// image's own `EFI/` tree). Used when an ISO carries no MBR boot code.
+    IsoExtract {
+        image: String,
+        #[serde(default)]
+        scheme: PartitionScheme,
+        /// Install SYSLINUX bootsector + MBR (BIOS boot path).
+        #[serde(default = "default_true")]
+        syslinux_bios: bool,
     },
     /// No image: just partition + format the device (Rufus "Non bootable").
     FormatDevice {
@@ -168,6 +184,13 @@ impl FlashPlan {
                 }
                 s
             }
+            FlashPlan::IsoExtract { scheme, syslinux_bios, .. } => {
+                if *syslinux_bios {
+                    format!("Linux · extracted + SYSLINUX ({})", scheme.describe())
+                } else {
+                    format!("Linux · extracted ({})", scheme.describe())
+                }
+            }
             FlashPlan::FormatDevice { scheme, fs, .. } => {
                 format!("No bootable · {fs} ({})", scheme.describe())
             }
@@ -179,6 +202,7 @@ impl FlashPlan {
             FlashPlan::RawDd { image, .. }
             | FlashPlan::WinFat32 { image, .. }
             | FlashPlan::WinUefiNtfs { image, .. }
+            | FlashPlan::IsoExtract { image, .. }
             | FlashPlan::WinToGo { image, .. } => Some(image),
             FlashPlan::FormatDevice { .. } => None,
         }
@@ -290,6 +314,31 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
         }
+    }
+
+    #[test]
+    fn iso_extract_roundtrip_and_defaults() {
+        let full = FlashPlan::IsoExtract {
+            image: "/x.iso".into(),
+            scheme: PartitionScheme::Mbr,
+            syslinux_bios: true,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"kind\":\"iso_extract\""), "{json}");
+        assert_eq!(serde_json::from_str::<FlashPlan>(&json).unwrap(), full);
+        assert_eq!(
+            full.describe(),
+            "Linux · extracted + SYSLINUX (MBR)"
+        );
+
+        // Legacy JSON without the flag keeps BIOS install enabled.
+        let legacy = r#"{"kind":"iso_extract","image":"/x.iso"}"#;
+        let p: FlashPlan = serde_json::from_str(legacy).unwrap();
+        match &p {
+            FlashPlan::IsoExtract { syslinux_bios, .. } => assert!(*syslinux_bios),
+            other => panic!("wrong plan {other:?}"),
+        }
+        assert_eq!(p.describe(), "Linux · extracted + SYSLINUX (GPT)");
     }
 
     #[test]

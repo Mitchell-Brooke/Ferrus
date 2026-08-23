@@ -20,6 +20,7 @@ fn main() {
         args.retain(|a| a != name);
         hit
     };
+    let dry_run = take_flag("--dry-run");
     let opt_hw = take_flag("--opt-hw");
     let opt_account = take_flag("--opt-account");
     let opt_bitlocker = take_flag("--opt-bitlocker");
@@ -89,7 +90,7 @@ fn main() {
         (Some(d), Some(i)) => (d.clone(), i.clone()),
         _ => {
             eprintln!(
-                "usage: flash-dev <device> <image> [--no-verify] [--plan raw|fat32|fat32-split|ntfs|wtg]\n\
+                "usage: flash-dev <device> <image> [--no-verify] [--plan raw|fat32|fat32-split|ntfs|wtg|extract]\n\
                  \x20             [--wim-index N] [--wtg-persist MiB] [--persist MiB] [--opt-hw]\n\
                  \x20             [--opt-account] [--opt-bitlocker] | --list-editions <image.iso>"
             );
@@ -121,6 +122,11 @@ fn main() {
             scheme: Default::default(),
             options: win_options,
         },
+        "extract" => FlashPlan::IsoExtract {
+            image: image.clone(),
+            scheme: ferrus_core::protocol::PartitionScheme::Mbr,
+            syslinux_bios: true,
+        },
         "wtg" => FlashPlan::WinToGo {
             image: image.clone(),
             wim_index,
@@ -129,7 +135,9 @@ fn main() {
             options: win_options,
         },
         other => {
-            eprintln!("unknown --plan '{other}' (raw|fat32|fat32-split|ntfs|wtg)");
+            eprintln!(
+                "unknown --plan '{other}' (raw|fat32|fat32-split|ntfs|wtg|extract)"
+            );
             std::process::exit(2);
         }
     });
@@ -145,8 +153,8 @@ fn main() {
             match client::decide_plan(&helper, std::path::Path::new(&image)) {
                 Ok((mut p, m)) => {
                     println!(
-                        "probe: windows={} total={} max_file={} oversized_wim={:?} flavor={:?}",
-                        m.is_windows, m.total_size, m.max_file_size, m.oversized_wim, m.linux_flavor
+                        "probe: windows={} hybrid={} total={} max_file={} oversized_wim={:?} flavor={:?}",
+                        m.is_windows, m.hybrid, m.total_size, m.max_file_size, m.oversized_wim, m.linux_flavor
                     );
                     // Persistence rides on the auto-selected raw plan.
                     if let FlashPlan::RawDd {
@@ -180,6 +188,11 @@ fn main() {
         eprintln!("helper not found; set FERRUS_HELPER_PATH");
         std::process::exit(2);
     });
+
+    if dry_run {
+        println!("DRY_RUN_OK");
+        return;
+    }
 
     let (rx, handle) = match client::spawn_flash_plan(&helper, &device, plan, None) {
         Ok(x) => x,
