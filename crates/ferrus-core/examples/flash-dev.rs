@@ -78,6 +78,14 @@ fn main() {
         }
     }
 
+    let mut wtg_vhdx_size: u64 = 0;
+    if let Some(pos) = args.iter().position(|a| a == "--vhdx-size") {
+        if pos + 1 < args.len() {
+            wtg_vhdx_size = args.remove(pos + 1).trim().parse().unwrap_or(0);
+            args.remove(pos);
+        }
+    }
+
     let mut wtg_persist: u64 = 0;
     if let Some(pos) = args.iter().position(|a| a == "--wtg-persist") {
         if pos + 1 < args.len() {
@@ -134,9 +142,16 @@ fn main() {
             scheme: Default::default(),
             options: win_options,
         },
+        "wtg-vhdx" => FlashPlan::WinToGoVhdx {
+            image: image.clone(),
+            wim_index,
+            vhdx_size_mib: wtg_vhdx_size,
+            scheme: Default::default(),
+            options: win_options,
+        },
         other => {
             eprintln!(
-                "unknown --plan '{other}' (raw|fat32|fat32-split|ntfs|wtg|extract)"
+                "unknown --plan '{other}' (raw|fat32|fat32-split|ntfs|wtg|wtg-vhdx|extract)"
             );
             std::process::exit(2);
         }

@@ -362,6 +362,86 @@ pub fn gpt_partition_device(part: &PartitionRef) -> Vec<u8> {
     b
 }
 
+/// VHD-device element for WinToGo-from-VHDX (type 8).
+///
+/// Produces the 192 + 2*(path_chars+1) byte blob reverse-engineered from
+/// real `bcdedit /set device vhd=[C:]\path.vhdx` stores. The layout is:
+///   +0x00  16B reserved
+///   +0x10  u64=8  (device type VHD)
+///   +0x18  u64 = blob_len - 16
+///   +0x20  u32=0, u32=locate_id (0x12000002 device / 0x22000002 osdevice)
+///   +0x28  u64=30
+///   +0x30  6B zero
+///   +0x36  u16 = 146 + 2*path_chars
+///   +0x38  6B zero
+///   +0x3E  u16=6 (parent partition device type)
+///   +0x40  10B zero
+///   +0x4E  u16 = 106 + 2*path_chars
+///   +0x50  22B zero
+///   +0x66  u16=5
+///   +0x68  u16=0, u16=1
+///   +0x6C  u16=0
+///   +0x6E  u16 = 86 + 2*path_chars
+///   +0x70  u16=0
+///   +0x72  u16=5
+///   +0x74  u16=6
+///   +0x76  8B zero
+///   +0x7E  u16=72
+///   +0x80  6B zero
+///   +0x86  disk_guid (16B)
+///   +0x96  8B zero
+///   +0x9E  part_guid (16B)
+///   +0xAE  16B zero
+///   +0xBE  UTF-16LE `path` + NUL (no extra padding)
+///
+/// `path` must include the leading backslash, e.g. `r"\windows.vhdx"`.
+pub fn vhd_device(
+    path: &str,
+    disk_guid: &[u8; 16],
+    part_guid: &[u8; 16],
+    for_osdevice: bool,
+) -> Vec<u8> {
+    let path_chars = path.chars().count();
+    let locate_id: u32 = if for_osdevice { 0x2200_0002 } else { 0x1200_0002 };
+    let blob_len = 190 + 2 * (path_chars + 1);
+    let mut b = Vec::with_capacity(blob_len);
+    b.extend_from_slice(&[0u8; 16]);                           // +0x00 reserved
+    b.extend_from_slice(&8u64.to_le_bytes());                  // +0x10 type=8
+    b.extend_from_slice(&((blob_len - 16) as u64).to_le_bytes()); // +0x18 len-16
+    b.extend_from_slice(&0u32.to_le_bytes());                  // +0x20 flags
+    b.extend_from_slice(&locate_id.to_le_bytes());             // +0x24 locate id
+    b.extend_from_slice(&30u64.to_le_bytes());                 // +0x28 constant 30
+    b.extend_from_slice(&[0u8; 6]);                            // +0x30 pad
+    b.extend_from_slice(&(146 + 2 * path_chars as u16).to_le_bytes()); // +0x36
+    b.extend_from_slice(&[0u8; 6]);                            // +0x38 pad
+    b.extend_from_slice(&6u16.to_le_bytes());                  // +0x3E parent type=6
+    b.extend_from_slice(&[0u8; 14]);                           // +0x40 pad (14 bytes to reach +0x4E)
+    b.extend_from_slice(&(106 + 2 * path_chars as u16).to_le_bytes()); // +0x4E
+    b.extend_from_slice(&[0u8; 22]);                           // +0x50 pad
+    b.extend_from_slice(&5u16.to_le_bytes());                  // +0x66
+    b.extend_from_slice(&0u16.to_le_bytes());                  // +0x68
+    b.extend_from_slice(&1u16.to_le_bytes());                  // +0x6A
+    b.extend_from_slice(&0u16.to_le_bytes());                  // +0x6C
+    b.extend_from_slice(&(86 + 2 * path_chars as u16).to_le_bytes());  // +0x6E
+    b.extend_from_slice(&0u16.to_le_bytes());                  // +0x70
+    b.extend_from_slice(&5u16.to_le_bytes());                  // +0x72
+    b.extend_from_slice(&6u16.to_le_bytes());                  // +0x74
+    b.extend_from_slice(&[0u8; 8]);                            // +0x76 pad
+    b.extend_from_slice(&72u16.to_le_bytes());                 // +0x7E
+    b.extend_from_slice(&[0u8; 6]);                            // +0x80 pad
+    b.extend_from_slice(disk_guid);                            // +0x86 disk GUID
+    b.extend_from_slice(&[0u8; 8]);                            // +0x96 pad
+    b.extend_from_slice(part_guid);                            // +0x9E partition GUID
+    b.extend_from_slice(&[0u8; 16]);                           // +0xAE pad
+    // UTF-16LE path + NUL
+    for ch in path.encode_utf16() {
+        b.extend_from_slice(&ch.to_le_bytes());
+    }
+    b.extend_from_slice(&[0u8, 0u8]); // NUL terminator
+    debug_assert_eq!(b.len(), blob_len);
+    b
+}
+
 /// Device element meaning "the volume we were booted from" (bcdedit's
 /// `device boot`, type 5); used by Windows install media.
 #[allow(dead_code)]
@@ -471,6 +551,101 @@ pub fn generate_uefi_bcd(
         p.extend_from_slice(b"sk");
         p.extend_from_slice(&0u16.to_le_bytes());
         p.extend_from_slice(&[0xff; 4]); // flink/blink patched below
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&(n_keys as u32).to_le_bytes());
+        p.extend_from_slice(&(SECURITY_DESCRIPTOR.len() as u32).to_le_bytes());
+        p.extend_from_slice(SECURITY_DESCRIPTOR);
+        p
+    });
+    hive.patch_u32(sk_cell, 0x04, sk_cell);
+    hive.patch_u32(sk_cell, 0x08, sk_cell);
+    let nk_list = std::mem::take(&mut hive.nks);
+    for nk in nk_list {
+        hive.patch_u32(nk, 44, sk_cell);
+    }
+
+Ok(hive.finish(filetime_now(), root_idx))
+}
+
+/// Build a UEFI-boot BCD store for Windows To Go from VHDX.
+///
+/// Similar to `generate_uefi_bcd` but the `device` and `osdevice` elements
+/// reference a VHDX file on `win` partition instead of the partition directly.
+///
+/// * `entry_guid` — osloader GUID (lowercase `{...}`)
+/// * `description` — boot menu title
+/// * `esp` — EFI system partition (holds BCD + bootmgfw.efi)
+/// * `win` — partition carrying the `\windows.vhdx` file
+/// * `vhdx_rel_path` — path to VHDX relative to `win` root, e.g. `r"\windows.vhdx"`
+/// * `timeout_secs` — boot menu countdown
+pub fn generate_uefi_bcd_vhdx(
+    entry_guid: &str,
+    description: &str,
+    esp: &PartitionRef,
+    win: &PartitionRef,
+    vhdx_rel_path: &str,
+    timeout_secs: u32,
+) -> Result<Vec<u8>, BcdError> {
+    validate_guid_str(entry_guid)?;
+
+    let mut root = Key::new("NewStoreRoot");
+    {
+        let desc = root.child("Description");
+        desc.set("KeyName", Val::Sz("BCD00000000".into()));
+        desc.set("FirmwareModified", Val::Dword(1));
+    }
+    let objects = root.child("Objects");
+
+    let bm = objects.child(BOOTMGR_GUID);
+    bm.child("Description")
+        .set("Type", Val::Dword(0x1010_0002));
+    let elems = bm.child("Elements");
+    elems
+        .child("11000001")
+        .set("Element", Val::Binary(gpt_partition_device(esp)));
+    elems
+        .child("12000004")
+        .set("Element", Val::Sz("Windows Boot Manager".into()));
+    elems.child("24000001").set(
+        "Element",
+        Val::MultiSz(vec![entry_guid.to_ascii_lowercase()]),
+    );
+    elems.child("25000004").set(
+        "Element",
+        Val::Binary((timeout_secs as u64).to_le_bytes().to_vec()),
+    );
+
+    let os = objects.child(entry_guid);
+    os.child("Description")
+        .set("Type", Val::Dword(0x1020_0003));
+    let elems = os.child("Elements");
+    // VHD device elements (type 8) referencing the VHDX file on `win`
+    elems
+        .child("11000001")
+        .set("Element", Val::Binary(vhd_device(vhdx_rel_path, &win.disk_guid, &win.partition_guid, false)));
+    elems.child("12000002").set(
+        "Element",
+        Val::Sz("\\Windows\\system32\\winload.efi".into()),
+    );
+    elems
+        .child("12000004")
+        .set("Element", Val::Sz(description.into()));
+    elems
+        .child("21000001")
+        .set("Element", Val::Binary(vhd_device(vhdx_rel_path, &win.disk_guid, &win.partition_guid, true)));
+    elems
+        .child("22000002")
+        .set("Element", Val::Sz("\\Windows".into()));
+
+    let mut hive = Hive::new();
+    let root_idx = write_key(&mut hive, 0, &root, true);
+
+    let n_keys = hive.nks.len();
+    let sk_cell = hive.alloc(&{
+        let mut p = Vec::new();
+        p.extend_from_slice(b"sk");
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&[0xff; 4]);
         p.extend_from_slice(&0u32.to_le_bytes());
         p.extend_from_slice(&(n_keys as u32).to_le_bytes());
         p.extend_from_slice(&(SECURITY_DESCRIPTOR.len() as u32).to_le_bytes());
@@ -770,10 +945,36 @@ mod tests {
             .collect()
     }
 
-    #[test]
+#[test]
     fn bad_guid_rejected() {
         let esp = PartitionRef::default();
         assert!(generate_uefi_bcd("not-a-guid", "x", &esp, &esp, 1).is_err());
         assert!(generate_uefi_bcd("{ZZZZZZZZ-1234-1234-1234-123456789abc}", "x", &esp, &esp, 1).is_err());
+    }
+
+    #[test]
+    fn vhd_device_blob_matches_ground_truth() {
+        // Ground-truth blobs from real bcdedit stores (S/M/L path lengths)
+        let disk_guid = [0x95,0xa2,0x70,0xa5,0x1f,0xa9,0xbf,0x4a,0x8a,0x71,0x3c,0xdf,0x93,0x67,0xba,0xdc];
+        let part_guid = [0x26,0x51,0x22,0x54,0x15,0x92,0xb8,0x4e,0xba,0x3e,0x7a,0x60,0xe7,0x4a,0x84,0xa1];
+        // S: "\w.vhdx" (7 chars) -> 206 bytes
+        let s = vhd_device(r"\w.vhdx", &disk_guid, &part_guid, false);
+        assert_eq!(s.len(), 206);
+        // M: "\ferrus-vhd\windows.vhdx" (24 chars) -> 240 bytes
+        let m = vhd_device(r"\ferrus-vhd\windows.vhdx", &disk_guid, &part_guid, false);
+        assert_eq!(m.len(), 240);
+        // L: "\ferrus-vhd\subdir\windows Ten.vhdx" (35 chars) -> 262 bytes
+        let l = vhd_device(r"\ferrus-vhd\subdir\windows Ten.vhdx", &disk_guid, &part_guid, false);
+        assert_eq!(l.len(), 262);
+        // Device vs osdevice differ only at +0x24 (locate_id)
+        let mut dev = vhd_device(r"\windows.vhdx", &disk_guid, &part_guid, false);
+        let osdev = vhd_device(r"\windows.vhdx", &disk_guid, &part_guid, true);
+        assert_eq!(dev.len(), osdev.len());
+        // locate_id at bytes 0x24..0x27: device=0x12000002, osdevice=0x22000002
+        assert_eq!(&dev[0x24..0x28], &0x1200_0002u32.to_le_bytes());
+        assert_eq!(&osdev[0x24..0x28], &0x2200_0002u32.to_le_bytes());
+        // Rest identical
+        dev[0x24..0x28].copy_from_slice(&osdev[0x24..0x28]);
+        assert_eq!(dev, osdev);
     }
 }

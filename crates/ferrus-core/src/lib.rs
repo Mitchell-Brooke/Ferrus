@@ -10,4 +10,5 @@ pub mod device;
 pub mod iso;
 pub mod protocol;
 pub mod unattend;
+pub mod vhdx;
 pub mod write;

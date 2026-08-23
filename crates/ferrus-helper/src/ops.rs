@@ -2,7 +2,7 @@
 //! mounting, tree copying and WIM splitting. Every external command failure
 //! carries its stderr so protocol errors stay actionable.
 
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,8 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context};
+use byteorder::{LittleEndian, WriteBytesExt};
+use crc32fast::hash as crc32_hash;
 use ferrus_core::iso::{self, ImageManifest};
 use ferrus_core::protocol::FlashPlan;
+use rand::RngCore;
 
 /// Registered PIDs of external children (e.g. wimlib) so `cancel` can kill them.
 pub type Pids = Arc<Mutex<Vec<u32>>>;
@@ -1335,6 +1338,130 @@ pub fn execute_plan(
                 scheme.describe()
             ))
         }
+
+        FlashPlan::WinToGoVhdx {
+            vhdx_size_mib,
+            wim_index,
+            scheme,
+            options,
+            ..
+        } => {
+            if *scheme == PartitionScheme::Mbr {
+                bail!("Windows To Go VHDX requires GPT (UEFI boot); pick the GPT scheme");
+            }
+            let image = PathBuf::from(plan.image_path().context("image missing")?);
+
+            release_partitions(dev);
+            progress_tick(send, "partitioning");
+            wipe_signatures(dev)?;
+            // ESP (FAT32) hosts bootmgfw + BCD; the NTFS partition carries
+            // the VHDX file. The WINDOWS partition comes last so sfdisk gives
+            // it whatever remains.
+            let mut p_esp = data_part("FERRUS", Some(1_048_576), false); // 512 MiB
+            p_esp.mbr_type = "0c";
+            let mut p_win = data_part("WINDOWS", None, false);
+            p_win.mbr_type = "07";
+            let parts = vec![p_esp, p_win];
+            partition(dev, PartitionScheme::Gpt, &parts)?;
+            reread_partitions(dev);
+            let p_esp_node = part_node(dev, 1);
+            let p_win_node = part_node(dev, 2);
+            wait_for_node(&p_esp_node, 10)?;
+            wait_for_node(&p_win_node, 10)?;
+
+            progress_tick(send, "formatting");
+            mkfs_any("FAT32", "FERRUS", &p_esp_node, None)?;
+            mkfs_any("NTFS", "WINDOWS", &p_win_node, None)?;
+
+            // BCD will reference the WINDOWS partition by its GPT GUID.
+            let disk_guid = gpt_disk_guid(dev_file)?;
+            let esp_ref = ferrus_core::bcd::PartitionRef {
+                partition_guid: gpt_part_guid(dev_file, 1)?,
+                disk_guid,
+            };
+            let win_ref = ferrus_core::bcd::PartitionRef {
+                partition_guid: gpt_part_guid(dev_file, 2)?,
+                disk_guid,
+            };
+
+            progress_tick(send, "applying Windows image to VHDX");
+            let iso_mnt = Mount::ro(&image)?;
+            let wim = locate_install_wim(iso_mnt.path())?;
+
+            // Create fixed VHDX on the NTFS partition.
+            let vhdx_mib = *vhdx_size_mib;
+            let tgt = Mount::rw(&p_win_node)?;
+            let vhdx_path = tgt.path().join("windows.vhdx");
+            create_fixed_vhdx(&vhdx_path, vhdx_mib, cancel)?;
+
+            // Attach VHDX via loop device, format NTFS inside, apply WIM.
+            let loop_dev = attach_vhdx(&vhdx_path)?;
+            mkfs_any("NTFS", "WINDOWS", &loop_dev, None)?;
+            let vhdx_mnt = Mount::rw(&loop_dev)?;
+            wimlib_apply(
+                &wim,
+                *wim_index,
+                vhdx_mnt.path(),
+                cancel,
+                pids,
+                &mut |d, t, ph| {
+                    send(Response::Progress {
+                        done: d,
+                        total: t,
+                        verifying: false,
+                        phase: Some(ph.into()),
+                    });
+                },
+            )?;
+
+            if options.any() {
+                progress_tick(send, "injecting unattend.xml");
+                let panther = vhdx_mnt.path().join("Windows").join("Panther");
+                std::fs::create_dir_all(&panther)
+                    .context("creating \\Windows\\Panther")?;
+                std::fs::write(panther.join("unattend.xml"), ferrus_core::unattend::generate(options))
+                    .context("writing Panther unattend.xml")?;
+            }
+
+            vhdx_mnt.unmount()?;
+            detach_vhdx(&loop_dev)?;
+
+            progress_tick(send, "writing boot files");
+            let esp = Mount::rw(&p_esp_node)?;
+            let boot_dir = esp.path().join("EFI").join("Microsoft").join("Boot");
+            std::fs::create_dir_all(&boot_dir)?;
+            std::fs::create_dir_all(esp.path().join("EFI").join("Boot"))?;
+            let src_fw = iso_mnt
+                .path()
+                .join("efi")
+                .join("microsoft")
+                .join("boot")
+                .join("bootmgfw.efi");
+            std::fs::copy(&src_fw, boot_dir.join("bootmgfw.efi"))
+                .with_context(|| format!("copying {}", src_fw.display()))?;
+            std::fs::copy(&src_fw, esp.path().join("EFI").join("Boot").join("bootx64.efi"))
+                .context("copying fallback bootx64.efi")?;
+
+            let entry_guid = new_entry_guid();
+            // VHD device element references the WINDOWS partition GUID + relative path
+            let bcd = ferrus_core::bcd::generate_uefi_bcd_vhdx(
+                &entry_guid,
+                "Windows To Go",
+                &esp_ref,
+                &win_ref,
+                "windows.vhdx",
+                10,
+            )?;
+            std::fs::write(boot_dir.join("BCD"), &bcd).context("writing BCD")?;
+
+            esp.unmount()?;
+            iso_mnt.unmount()?;
+            sync_dev(dev);
+            Ok(format!(
+                "Windows To Go (VHDX) ready ({}, entry {entry_guid}, {vhdx_mib} MiB)",
+                scheme.describe()
+            ))
+        }
     }
 }
 
@@ -1568,4 +1695,189 @@ fn new_entry_guid() -> String {
         &h[16..20],
         &h[20..32]
     )
+}
+
+/// Create a minimal fixed VHDX file (dynamic is not supported by Windows boot).
+/// Layout per [MS-VHDX]: File Type Identifier (1 MiB) + Header (1 MiB) +
+/// Region Table (variable) + Data Region (logical size) + Footer (512 bytes).
+fn create_fixed_vhdx(path: &Path, size_mib: u64, cancel: &AtomicBool) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+
+    let logical_bytes = size_mib * 1024 * 1024;
+    let sector_size = 512u64;
+    let logical_sectors = logical_bytes / sector_size;
+
+    // File layout:
+    // - File Type Identifier: 1 MiB at offset 0 (padded with zeros)
+    // - Header: 1 MiB at offset 1 MiB
+    // - Region Table: starts at 2 MiB, contains 1 data region entry
+    // - Data Region: aligned to 1 MiB after region table
+    // - Footer: last 512 bytes of file
+
+    let header_offset = 1024 * 1024; // 1 MiB
+    let region_table_offset = 2 * 1024 * 1024; // 2 MiB
+    let region_table_size = 1 * 1024 * 1024; // 1 MiB (one region entry)
+
+    let data_region_offset = ((region_table_offset + region_table_size) + 1024 * 1024 - 1) / (1024 * 1024) * (1024 * 1024);
+    let footer_offset = data_region_offset + logical_bytes;
+    let file_size = footer_offset + 512;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("creating VHDX {}", path.display()))?;
+
+    // Zero the entire file first (sparse allocation is fine)
+    file.set_len(file_size)
+        .context("pre-allocating VHDX file")?;
+
+    // 1. File Type Identifier at offset 0 (1 MiB)
+    // Signature: "vhdxfile" (8 bytes) + zeros
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(b"vhdxfile")?;
+    // Rest is already zero from set_len
+
+    // 2. Header at 1 MiB
+    file.seek(SeekFrom::Start(header_offset))?;
+    // Signature: "vhdxhead" (8 bytes)
+    file.write_all(b"vhdxhead")?;
+    // Checksum (4 bytes) - computed later, write zeros for now
+    let checksum_pos = file.stream_position()?;
+    file.write_u32::<LittleEndian>(0)?;
+    // Sequence number (8 bytes) - 1
+    file.write_u64::<LittleEndian>(1)?;
+    // File write GUID (16 bytes)
+    let mut write_guid = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut write_guid);
+    file.write_all(&write_guid)?;
+    // Log file GUID (16 bytes) - all zeros for fixed
+    file.write_all(&[0u8; 16])?;
+    // Data write GUID (16 bytes)
+    let mut data_write_guid = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut data_write_guid);
+    file.write_all(&data_write_guid)?;
+    // Log version (4 bytes) - 0
+    file.write_u32::<LittleEndian>(0)?;
+    // Version (4 bytes) - 1
+    file.write_u32::<LittleEndian>(1)?;
+    // Log length (8 bytes) - 0
+    file.write_u64::<LittleEndian>(0)?;
+    // Log offset (8 bytes) - 0
+    file.write_u64::<LittleEndian>(0)?;
+
+    // Pad header to 1 MiB
+    let header_end = file.stream_position()?;
+    let pad = header_offset + 1024 * 1024 - header_end;
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad as usize])?;
+    }
+
+    // 3. Region Table at 2 MiB
+    file.seek(SeekFrom::Start(region_table_offset))?;
+    // Signature: "regt" (4 bytes)
+    file.write_all(b"regt")?;
+    // Reserved (4 bytes)
+    file.write_u32::<LittleEndian>(0)?;
+    // Entry count (8 bytes) - 1 data region
+    file.write_u64::<LittleEndian>(1)?;
+
+    // Region entry:
+    // File offset (8 bytes)
+    file.write_u64::<LittleEndian>(data_region_offset)?;
+    // Length (8 bytes) - logical size
+    file.write_u64::<LittleEndian>(logical_bytes)?;
+    // GUID (16 bytes) - data region GUID
+    let mut data_region_guid = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut data_region_guid);
+    file.write_all(&data_region_guid)?;
+    // Reserved (16 bytes)
+    file.write_all(&[0u8; 16])?;
+
+    // Pad region table to 1 MiB
+    let rt_end = file.stream_position()?;
+    let pad = region_table_offset + region_table_size - rt_end;
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad as usize])?;
+    }
+
+    // 4. Data region - already zeroed by set_len, but we need to write
+    // the "vhdx" signature at the start of the data region for valid NTFS
+    // Actually, the data region is raw disk content; we'll format NTFS on it later
+
+    // 5. Footer at end - 512 bytes
+    file.seek(SeekFrom::Start(footer_offset))?;
+    // Signature: "vhdxfoot" (8 bytes)
+    file.write_all(b"vhdxfoot")?;
+    // Checksum (4 bytes) - compute over footer
+    let footer_checksum_pos = file.stream_position()?;
+    file.write_u32::<LittleEndian>(0)?;
+    // Reserved (4 bytes)
+    file.write_u32::<LittleEndian>(0)?;
+    // Creator info (4 bytes) - "win " = 0x206e6977
+    file.write_u32::<LittleEndian>(0x206e6977)?;
+    // Creator version (4 bytes) - 0x000a0001 (Windows 10)
+    file.write_u32::<LittleEndian>(0x000a0001)?;
+    // Creator host OS (4 bytes) - 0x00000004 (Windows)
+    file.write_u32::<LittleEndian>(4)?;
+    // File size (8 bytes)
+    file.write_u64::<LittleEndian>(file_size)?;
+    // Data write GUID (16 bytes) - same as header
+    file.write_all(&data_write_guid)?;
+    // Log GUID (16 bytes) - zeros
+    file.write_all(&[0u8; 16])?;
+    // Data offset (8 bytes) - data region offset
+    file.write_u64::<LittleEndian>(data_region_offset)?;
+    // Log offset (8 bytes) - 0
+    file.write_u64::<LittleEndian>(0)?;
+
+    // Pad footer to 512 bytes
+    let footer_end = file.stream_position()?;
+    let pad = footer_offset + 512 - footer_end;
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad as usize])?;
+    }
+
+    // Compute and write header checksum (CRC32 of header, with checksum field zeroed)
+    let header_data = std::fs::read(path)?;
+    let header_start = header_offset as usize;
+    let header_slice = &header_data[header_start..header_start + 1024 * 1024];
+    let checksum = crc32_hash(header_slice);
+    file.seek(std::io::SeekFrom::Start(checksum_pos))?;
+    file.write_u32::<byteorder::LittleEndian>(checksum)?;
+
+    // Compute and write footer checksum
+    let footer_start = footer_offset as usize;
+    let footer_data = &header_data[footer_start..footer_start + 512];
+    let footer_checksum = crc32_hash(footer_data);
+    file.seek(std::io::SeekFrom::Start(footer_checksum_pos))?;
+    file.write_u32::<byteorder::LittleEndian>(footer_checksum)?;
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Attach VHDX via loop device, return the loop device path (e.g. /dev/loop6).
+fn attach_vhdx(vhdx_path: &Path) -> anyhow::Result<PathBuf> {
+    let out = run("losetup", &["-f", "--show", "-P", &vhdx_path.to_string_lossy()], None)
+        .context("losetup attach VHDX")?;
+    let dev = out.trim();
+    if dev.is_empty() {
+        bail!("losetup returned empty device");
+    }
+    Ok(PathBuf::from(dev))
+}
+
+/// Detach VHDX loop device.
+fn detach_vhdx(loop_dev: &Path) -> anyhow::Result<()> {
+    run("losetup", &["-d", &loop_dev.to_string_lossy()], None)
+        .context("losetup detach VHDX")
+        .map(drop)
 }

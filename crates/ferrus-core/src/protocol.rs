@@ -115,6 +115,22 @@ pub enum FlashPlan {
         #[serde(default)]
         options: WinOptions,
     },
+/// Windows To Go from VHDX partition: ESP (FAT32) holds `bootmgfw.efi` + BCD
+/// referencing a dedicated raw VHDX partition. The VHDX partition contains
+/// the full Windows installation (applied via `wimlib`). `vhdx_size_mib`
+/// sets the VHDX capacity (default 64 GiB or image size rounded up).
+WinToGoVhdx {
+    image: String,
+    #[serde(default)]
+    wim_index: u32,
+    /// VHDX size in MiB; 0 = auto (image size + 25% headroom, min 64 GiB).
+    #[serde(default)]
+    vhdx_size_mib: u64,
+    #[serde(default)]
+    scheme: PartitionScheme,
+    #[serde(default)]
+    options: WinOptions,
+},
     /// Non-hybrid Linux ISO: Rufus-style extraction. The ISO tree is copied
     /// onto a single FAT32 partition instead of being sector-copied, and
     /// SYSLINUX is installed for BIOS booting (UEFI machines boot from the
@@ -191,6 +207,26 @@ impl FlashPlan {
                     format!("Linux · extracted ({})", scheme.describe())
                 }
             }
+            FlashPlan::WinToGoVhdx {
+                wim_index,
+                scheme,
+                vhdx_size_mib,
+                ..
+            } => {
+                let mut s = if *wim_index > 0 {
+                    format!(
+                        "Windows To Go (VHDX) · edition {} ({})",
+                        wim_index,
+                        scheme.describe()
+                    )
+                } else {
+                    format!("Windows To Go (VHDX) ({})", scheme.describe())
+                };
+                if *vhdx_size_mib > 0 {
+                    s.push_str(&format!(", VHDX {vhdx_size_mib} MiB"));
+                }
+                s
+            }
             FlashPlan::FormatDevice { scheme, fs, .. } => {
                 format!("No bootable · {fs} ({})", scheme.describe())
             }
@@ -203,7 +239,8 @@ impl FlashPlan {
             | FlashPlan::WinFat32 { image, .. }
             | FlashPlan::WinUefiNtfs { image, .. }
             | FlashPlan::IsoExtract { image, .. }
-            | FlashPlan::WinToGo { image, .. } => Some(image),
+            | FlashPlan::WinToGo { image, .. }
+            | FlashPlan::WinToGoVhdx { image, .. } => Some(image),
             FlashPlan::FormatDevice { .. } => None,
         }
     }
@@ -339,6 +376,24 @@ mod tests {
             other => panic!("wrong plan {other:?}"),
         }
         assert_eq!(p.describe(), "Linux · extracted + SYSLINUX (GPT)");
+    }
+
+    #[test]
+    fn wtg_vhdx_roundtrip() {
+        let full = FlashPlan::WinToGoVhdx {
+            image: "/win.iso".into(),
+            wim_index: 1,
+            vhdx_size_mib: 65536,
+            scheme: PartitionScheme::Gpt,
+            options: WinOptions::default(),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"kind\":\"win_to_go_vhdx\""), "{json}");
+        assert_eq!(serde_json::from_str::<FlashPlan>(&json).unwrap(), full);
+        assert_eq!(
+            full.describe(),
+            "Windows To Go (VHDX) · edition 1 (GPT), VHDX 65536 MiB"
+        );
     }
 
     #[test]
