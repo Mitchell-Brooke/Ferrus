@@ -1397,7 +1397,17 @@ pub fn execute_plan(
             // Attach VHDX via loop device, format NTFS inside, apply WIM.
             let loop_dev = attach_vhdx(&vhdx_path)?;
             mkfs_any("NTFS", "WINDOWS", &loop_dev, None)?;
-            let vhdx_mnt = Mount::rw(&loop_dev)?;
+            // Copy boot files from ISO to ESP
+            let esp = Mount::rw(&p_esp_node)?;
+            let boot_dir = esp.path().join("EFI").join("Microsoft").join("Boot");
+            std::fs::create_dir_all(&boot_dir)?;
+            std::fs::create_dir_all(esp.path().join("EFI").join("Boot"))?;
+            let src_fw = iso_mnt.path().join("efi").join("microsoft").join("boot").join("bootmgfw.efi");
+            std::fs::copy(&src_fw, boot_dir.join("bootmgfw.efi")).context("copying bootmgfw.efi")?;
+            std::fs::copy(&src_fw, esp.path().join("EFI").join("Boot").join("bootx64.efi")).context("copying fallback bootx64.efi")?;
+
+            // Attach VHDX via loop device, format NTFS inside, apply WIM.
+            let loop_dev = attach_vhdx(&vhdx_path)?;
             wimlib_apply(
                 &wim,
                 *wim_index,
