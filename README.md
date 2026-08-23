@@ -3,7 +3,7 @@
 A native Linux bootable-USB creator with Rufus-grade feature coverage.
 Rust + GTK4 + libadwaita. GPL-3.0-or-later.
 
-## Status: M5 (Windows To Go)
+## Status: M7 (Windows To Go from VHDX)
 
 - [x] M0: workspace, udev device enumeration, helper protocol skeleton, Adwaita GUI
 - [x] M1: raw DD write engine — 4 MiB chunks, live progress, mid-write cancel,
@@ -71,9 +71,38 @@ Rust + GTK4 + libadwaita. GPL-3.0-or-later.
   - GUI: "Windows To Go" switch + named edition combo + storage SpinRow in
     the Windows group (forces GPT); flash-dev: `--plan wtg [--wim-index N]
     [--wtg-persist MiB]`, `--list-editions <iso>`
+- [x] M6:
+  - Non-hybrid Linux ISO extraction (`IsoExtract` plan): Rufus-style tree
+    copy onto a single FAT32 partition instead of sector-copying; SYSLINUX
+    BIOS install (ldlinux.c32, syslinux.cfg, bootsector, MBR stub) when
+    requested; auto-detected when an ISO carries no MBR boot code (sector-0
+    heuristic) and has an isolinux/ tree; falls back to raw-DD for hybrids
+  - SYSLINUX installer: locates `ldlinux.c32` and `mbr.bin` across distro
+    layouts (Arch, Debian, Fedora, upstream), duplicates `isolinux.cfg` as
+    `syslinux.cfg`, writes MBR code (first 440 bytes), sets boot flag; GPT
+    coerced to MBR for BIOS installs
+  - GUI: no changes needed (falls through the `_` dynamic-row branch)
+  - flash-dev: `--plan extract`, `--dry-run`, hybrid field in probe output
+- [x] M7:
+  - Windows To Go from VHDX (`WinToGoVhdx` plan): ESP (FAT32) hosts
+    `bootmgfw.efi` + BCD; the NTFS partition carries a fixed VHDX file
+    containing the full Windows installation (applied via `wimlib-imagex`)
+  - Native VHDX writer (`ferrus-core::ops::create_fixed_vhdx`): creates
+    minimal fixed VHDX per MS-VHDX spec (File Type Identifier, Header,
+    Region Table, Data Region, Footer with CRC32 checksums); attaches via
+    `losetup -P`, formats inner NTFS, applies WIM, detaches
+  - BCD VHD device elements (type 8): `device` (0x11000001) and `osdevice`
+    (0x21000001) reference the WINDOWS partition GUID + relative path
+    `\windows.vhdx`; byte-level layout reverse-engineered from real
+    `bcdedit /set device vhd=[C:]\path.vhdx` stores
+  - GUI: "Windows To Go (VHDX)" switch + VHDX size SpinRow in the Windows
+    group (forces GPT); flash-dev: `--plan wtg-vhdx [--wim-index N]
+    [--vhdx-size MiB]`
 - [x] CI: GitHub Actions — unit tests + clippy on every push, and on tag
       pushes an automatic release job building the `.deb` and attaching it
-- [ ] M6+: VHDX-native boot, persistence for WTG, remaining Rufus features
+- [x] Packaging: Debian `.deb`, RPM `.rpm`, Arch `PKGBUILD`, Flatpak manifest,
+      AppStream metainfo, man page
+- [ ] M8+: persistence for WTG, remaining Rufus features
 
 ## Layout
 
@@ -113,12 +142,19 @@ cargo run -p ferrus-core --example format-dev -- /dev/sdX FAT32 MYLABEL \
 
 ```sh
 cargo build --workspace --release
-CARGO_TARGET_DIR=target pack/build-deb.sh        # → ferrus_0.1.0_amd64.deb
+CARGO_TARGET_DIR=target pack/build-deb.sh        # → ferrus_0.3.0_amd64.deb
 ```
 
 Installs `/usr/bin/ferrus`, `/usr/libexec/ferrus/ferrus-helper`,
 `/usr/share/ferrus/uefi-ntfs.img`, desktop entry and polkit action
 (`com.ferrus.ferrus.run-helper`, auth_admin_keep).
+
+Additional formats:
+- RPM: `pack/ferrus.spec` (use `rpmbuild -ta ferrus-0.3.0.tar.gz`)
+- Arch: `pack/PKGBUILD` (use `makepkg -si`)
+- Flatpak: `pack/io.github.Mitchell-Brooke.Ferrus.yml`
+- AppStream: `pack/io.github.Mitchell-Brooke.Ferrus.metainfo.xml`
+- Man page: `pack/ferrus.1`
 
 ### res/uefi-ntfs.img provenance
 
