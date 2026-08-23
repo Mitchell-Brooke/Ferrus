@@ -126,6 +126,9 @@ WinToGoVhdx {
     /// VHDX size in MiB; 0 = auto (image size + 25% headroom, min 64 GiB).
     #[serde(default)]
     vhdx_size_mib: u64,
+    /// Extra data partition size in MiB; 0 = none.
+    #[serde(default)]
+    persist_mib: u64,
     #[serde(default)]
     scheme: PartitionScheme,
     #[serde(default)]

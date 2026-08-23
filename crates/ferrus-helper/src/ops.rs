@@ -1344,6 +1344,7 @@ pub fn execute_plan(
             wim_index,
             scheme,
             options,
+            persist_mib,
             ..
         } => {
             if *scheme == PartitionScheme::Mbr {
@@ -1356,21 +1357,33 @@ pub fn execute_plan(
             wipe_signatures(dev)?;
             // ESP (FAT32) hosts bootmgfw + BCD; the NTFS partition carries
             // the VHDX file. The WINDOWS partition comes last so sfdisk gives
-            // it whatever remains.
+            // it whatever remains. Optional trailing data partition for user files.
             let mut p_esp = data_part("FERRUS", Some(1_048_576), false); // 512 MiB
             p_esp.mbr_type = "0c";
+            let mut parts = vec![p_esp];
+            if *persist_mib > 0 {
+                let mut p_data = data_part("FERRUSDATA", Some(*persist_mib * 2048), false);
+                p_data.mbr_type = "07";
+                parts.push(p_data);
+            }
             let mut p_win = data_part("WINDOWS", None, false);
             p_win.mbr_type = "07";
-            let parts = vec![p_esp, p_win];
+            let win_n = parts.len() as u8 + 1;
+            parts.push(p_win);
             partition(dev, PartitionScheme::Gpt, &parts)?;
             reread_partitions(dev);
             let p_esp_node = part_node(dev, 1);
-            let p_win_node = part_node(dev, 2);
+            let p_win_node = part_node(dev, win_n);
             wait_for_node(&p_esp_node, 10)?;
             wait_for_node(&p_win_node, 10)?;
 
             progress_tick(send, "formatting");
             mkfs_any("FAT32", "FERRUS", &p_esp_node, None)?;
+            if *persist_mib > 0 {
+                let data_node = part_node(dev, 2);
+                wait_for_node(&data_node, 10)?;
+                mkfs_any("NTFS", "FERRUSDATA", &data_node, None)?;
+            }
             mkfs_any("NTFS", "WINDOWS", &p_win_node, None)?;
 
             // BCD will reference the WINDOWS partition by its GPT GUID.
@@ -1380,7 +1393,7 @@ pub fn execute_plan(
                 disk_guid,
             };
             let win_ref = ferrus_core::bcd::PartitionRef {
-                partition_guid: gpt_part_guid(dev_file, 2)?,
+                partition_guid: gpt_part_guid(dev_file, win_n)?,
                 disk_guid,
             };
 
@@ -1397,17 +1410,7 @@ pub fn execute_plan(
             // Attach VHDX via loop device, format NTFS inside, apply WIM.
             let loop_dev = attach_vhdx(&vhdx_path)?;
             mkfs_any("NTFS", "WINDOWS", &loop_dev, None)?;
-            // Copy boot files from ISO to ESP
-            let esp = Mount::rw(&p_esp_node)?;
-            let boot_dir = esp.path().join("EFI").join("Microsoft").join("Boot");
-            std::fs::create_dir_all(&boot_dir)?;
-            std::fs::create_dir_all(esp.path().join("EFI").join("Boot"))?;
-            let src_fw = iso_mnt.path().join("efi").join("microsoft").join("boot").join("bootmgfw.efi");
-            std::fs::copy(&src_fw, boot_dir.join("bootmgfw.efi")).context("copying bootmgfw.efi")?;
-            std::fs::copy(&src_fw, esp.path().join("EFI").join("Boot").join("bootx64.efi")).context("copying fallback bootx64.efi")?;
-
-            // Attach VHDX via loop device, format NTFS inside, apply WIM.
-            let loop_dev = attach_vhdx(&vhdx_path)?;
+            let vhdx_mnt = Mount::rw(&loop_dev)?;
             wimlib_apply(
                 &wim,
                 *wim_index,
@@ -1467,8 +1470,13 @@ pub fn execute_plan(
             esp.unmount()?;
             iso_mnt.unmount()?;
             sync_dev(dev);
+            let storage = if *persist_mib > 0 {
+                format!(", +{persist_mib} MiB data")
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "Windows To Go (VHDX) ready ({}, entry {entry_guid}, {vhdx_mib} MiB)",
+                "Windows To Go (VHDX) ready ({}, entry {entry_guid}, {vhdx_mib} MiB{storage})",
                 scheme.describe()
             ))
         }
