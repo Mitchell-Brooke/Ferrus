@@ -149,6 +149,93 @@ pub fn have_wimlib() -> bool {
     })
 }
 
+/// Edition names inside a Windows ISO's install.wim/esd.
+///
+/// Streams the WIM out of the ISO with `xorriso -osirrox` (unprivileged,
+/// no root needed) and reads its metadata with `wimlib-imagex info`.
+/// Returns an empty Vec when either tool is unavailable or probing
+/// fails — callers should fall back to a plain numeric edition picker.
+pub fn windows_editions(iso: &Path) -> Vec<String> {
+    if !have_wimlib() || !iso.is_file() {
+        return Vec::new();
+    }
+    let work = std::env::temp_dir().join(format!(
+        "ferrus-editions-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::create_dir_all(&work).is_err() {
+        return Vec::new();
+    }
+    let result = probe_editions(iso, &work);
+    std::fs::remove_dir_all(&work).ok();
+    result.unwrap_or_default()
+}
+
+fn probe_editions(iso: &Path, work: &Path) -> Option<Vec<String>> {
+    // Windows media mixes letter cases between vendors; osirrox paths are
+    // literal, so try the realistic spellings until one extracts.
+    const CANDIDATES: [&str; 6] = [
+        "/sources/install.wim",
+        "/SOURCES/INSTALL.WIM",
+        "/sources/INSTALL.WIM",
+        "/sources/install.esd",
+        "/SOURCES/INSTALL.ESD",
+        "/sources/INSTALL.ESD",
+    ];
+    let mut wim_path = None;
+    for cand in CANDIDATES {
+        let dest = work.join("image.bin");
+        let status = std::process::Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(iso)
+            .args(["-extract", cand])
+            .arg(&dest)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if status.success() && dest.is_file() {
+            wim_path = Some(dest);
+            break;
+        }
+    }
+    let wim_path = wim_path?;
+
+    let out = std::process::Command::new("wimlib-imagex")
+        .arg("info")
+        .arg(&wim_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut images = parse_wim_info(&text);
+    images.sort_by_key(|(i, _)| *i);
+    Some(images.into_iter().map(|(_, n)| n).collect())
+}
+
+/// Pull `(index, name)` pairs out of `wimlib-imagex info` output.
+fn parse_wim_info(text: &str) -> Vec<(u32, String)> {
+    let mut images = Vec::new();
+    let mut index: Option<u32> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Index:") {
+            index = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("Name:") {
+            if let Some(i) = index {
+                images.push((i, rest.trim().to_string()));
+            }
+        }
+    }
+    images
+}
+
 /// Map a manifest onto a concrete flashing plan (Rufus's auto behaviour).
 pub fn choose_plan(m: &ImageManifest, image: &Path) -> FlashPlan {
     use crate::protocol::{PartitionScheme, WinOptions};
@@ -325,6 +412,34 @@ mod tests {
             }
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn wim_info_parsing() {
+        let sample = "\
+Image Count: 2
+Compression: LZX
+Chunk Size: 32768
+
+Index: 1
+Name: Windows 11 Home
+Description: Windows 11 Home
+Flags: Home
+Files: 55123
+
+Index: 2
+Name: Windows 11 Pro
+Description: Windows 11 Pro
+";
+        assert_eq!(
+            parse_wim_info(sample),
+            vec![
+                (1u32, "Windows 11 Home".to_string()),
+                (2, "Windows 11 Pro".to_string())
+            ]
+        );
+        assert!(parse_wim_info("Index: not-a-number\nName: X").is_empty());
+        assert!(parse_wim_info("").is_empty());
     }
 
     #[test]

@@ -96,12 +96,16 @@ pub enum FlashPlan {
     /// carries `bootmgfw.efi` + a generated BCD; the NTFS partition gets a
     /// full `wimlib`-applied Windows tree with an optional answer file.
     /// `wim_index` selects the image inside a multi-edition install.wim/esd
-    /// (`/index:N`, default 1).
+    /// (`/index:N`, default 1). `persist_mib` appends an extra storage
+    /// partition behind the Windows one.
     WinToGo {
         image: String,
         /// 1-based index into the WIM; 0 = auto (first).
         #[serde(default)]
         wim_index: u32,
+        /// Extra data partition size in MiB; 0 = none.
+        #[serde(default)]
+        persist_mib: u64,
         #[serde(default)]
         scheme: PartitionScheme,
         #[serde(default)]
@@ -144,8 +148,13 @@ impl FlashPlan {
             FlashPlan::WinUefiNtfs { scheme, .. } => {
                 format!("Windows · UEFI:NTFS ({})", scheme.describe())
             }
-            FlashPlan::WinToGo { wim_index, scheme, .. } => {
-                if *wim_index > 0 {
+            FlashPlan::WinToGo {
+                wim_index,
+                scheme,
+                persist_mib,
+                ..
+            } => {
+                let mut s = if *wim_index > 0 {
                     format!(
                         "Windows To Go · edition {} ({})",
                         wim_index,
@@ -153,7 +162,11 @@ impl FlashPlan {
                     )
                 } else {
                     format!("Windows To Go ({})", scheme.describe())
+                };
+                if *persist_mib > 0 {
+                    s.push_str(&format!(", +{persist_mib} MiB storage"));
                 }
+                s
             }
             FlashPlan::FormatDevice { scheme, fs, .. } => {
                 format!("No bootable · {fs} ({})", scheme.describe())
@@ -266,6 +279,7 @@ mod tests {
                 plan: FlashPlan::WinToGo {
                     image: "/tmp/win.iso".into(),
                     wim_index: 2,
+                    persist_mib: 0,
                     scheme: PartitionScheme::Gpt,
                     options: WinOptions::default(),
                 },
@@ -354,11 +368,12 @@ mod tests {
         );
         assert_eq!(raw.describe(), "raw DD image + 4096 MiB persistence");
 
-        // WinToGo: wim_index defaults to 0 (auto) for legacy JSON.
+        // WinToGo: wim_index/persist_mib default to 0 for legacy JSON.
         let legacy_wtg = r#"{"kind":"win_to_go","image":"/x"}"#;
         let wtg = FlashPlan::WinToGo {
             image: "/x".into(),
             wim_index: 0,
+            persist_mib: 0,
             scheme: PartitionScheme::Gpt,
             options: WinOptions::default(),
         };
@@ -367,10 +382,14 @@ mod tests {
         let picked = FlashPlan::WinToGo {
             image: "/x".into(),
             wim_index: 3,
+            persist_mib: 8192,
             scheme: PartitionScheme::Gpt,
             options: WinOptions::default(),
         };
-        assert_eq!(picked.describe(), "Windows To Go · edition 3 (GPT)");
+        assert_eq!(
+            picked.describe(),
+            "Windows To Go · edition 3 (GPT), +8192 MiB storage"
+        );
 
         assert_eq!(
             describe_of(legacy),

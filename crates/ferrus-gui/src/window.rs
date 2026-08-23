@@ -53,7 +53,12 @@ struct Inner {
     opt_bitlocker: SwitchRow,
     /// Windows To Go (Windows plans only).
     wtg_switch: SwitchRow,
-    wtg_index: adw::SpinRow,
+    /// Edition picker fed with real names from install.wim/esd.
+    wtg_edition: ComboRow,
+    /// Names behind `wtg_edition`; position i means WIM index i+1.
+    editions: RefCell<Vec<String>>,
+    /// Extra storage partition for Windows To Go (MiB).
+    wtg_persist: adw::SpinRow,
     status_label: Label,
     progress: ProgressBar,
     start_btn: Button,
@@ -192,10 +197,16 @@ impl Window {
         wtg_switch.set_title("Windows To Go");
         wtg_switch.set_subtitle("Boot the full Windows desktop from the stick itself");
 
-        let wtg_index = adw::SpinRow::with_range(0.0, 99.0, 1.0);
-        wtg_index.set_title("WIM edition index");
-        wtg_index.set_subtitle("0 = first edition in install.wim/esd");
-        wtg_index.set_visible(false);
+        let wtg_edition = ComboRow::new();
+        wtg_edition.set_title("Edition");
+        wtg_edition.set_subtitle("Which image inside install.wim/esd to apply");
+        wtg_edition.set_model(Some(&StringList::new(&["First edition"])));
+        wtg_edition.set_visible(false);
+
+        let wtg_persist = adw::SpinRow::with_range(0.0, 131_072.0, 512.0);
+        wtg_persist.set_title("Storage partition size (MiB)");
+        wtg_persist.set_subtitle("Extra data partition behind the Windows one");
+        wtg_persist.set_visible(false);
 
         let opt_hw = SwitchRow::new();
         opt_hw.set_title("Remove hardware requirement checks");
@@ -212,7 +223,8 @@ impl Window {
         let win_group = PreferencesGroup::new();
         win_group.set_title("Windows user experience");
         win_group.add(&wtg_switch);
-        win_group.add(&wtg_index);
+        win_group.add(&wtg_edition);
+        win_group.add(&wtg_persist);
         win_group.add(&opt_hw);
         win_group.add(&opt_account);
         win_group.add(&opt_bitlocker);
@@ -317,7 +329,9 @@ impl Window {
             opt_account,
             opt_bitlocker,
             wtg_switch,
-            wtg_index,
+            wtg_edition,
+            editions: RefCell::new(Vec::new()),
+            wtg_persist,
             status_label,
             progress,
             start_btn,
@@ -343,7 +357,9 @@ impl Window {
 
         let me = inner.clone();
         inner.wtg_switch.connect_active_notify(move |sw| {
-            me.wtg_index.set_visible(sw.is_active());
+            let on = sw.is_active();
+            me.wtg_edition.set_visible(on);
+            me.wtg_persist.set_visible(on);
             Self::static_update_sensitivity(&me);
         });
 
@@ -461,7 +477,8 @@ impl Window {
         me.opt_account.set_sensitive(!busy);
         me.opt_bitlocker.set_sensitive(!busy);
         me.wtg_switch.set_sensitive(!busy);
-        me.wtg_index.set_sensitive(!busy);
+        me.wtg_edition.set_sensitive(!busy);
+        me.wtg_persist.set_sensitive(!busy);
 
         let probe_ok = matches!(
             me.probe.get(),
@@ -507,6 +524,8 @@ impl Window {
         *me.plan.borrow_mut() = None;
         *me.flavor.borrow_mut() = None;
         me.persist_row.set_value(0.0);
+        me.wtg_persist.set_value(0.0);
+        Self::static_fill_editions(me, &[]);
         me.probe.set(ProbeState::Running);
 
         let name = std::path::Path::new(path)
@@ -538,7 +557,8 @@ impl Window {
     /// Probe the selected image in a background thread; results land on the
     /// main loop through a channel + timeout poller (GTK is not thread-safe).
     fn static_start_probe(me: &Rc<Inner>, path: &str) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(FlashPlan, Option<String>), String>>();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(FlashPlan, Option<String>, Vec<String>), String>>();
         let path = path.to_string();
         std::thread::spawn(move || {
             let result = client::resolve_helper_path()
@@ -548,19 +568,28 @@ impl Window {
                         .map(|(plan, manifest)| (plan, manifest.linux_flavor.clone()))
                         .map_err(|e| format!("{e:#}"))
                 });
-            let _ = tx.send(result);
+            // Edition names only matter for Windows plans; failures here are
+            // non-fatal (the GUI falls back to a numeric picker).
+            let editions = match &result {
+                Ok((FlashPlan::WinFat32 { .. } | FlashPlan::WinUefiNtfs { .. }, _)) => {
+                    ferrus_core::iso::windows_editions(std::path::Path::new(&path))
+                }
+                _ => Vec::new(),
+            };
+            let _ = tx.send(result.map(|(p, f)| (p, f, editions)));
         });
 
         let me2 = me.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
             match rx.try_recv() {
-                Ok(Ok((plan, flavor))) => {
+                Ok(Ok((plan, flavor, editions))) => {
                     me2.status_label.set_text(&format!(
                         "Detected: {} — ready to flash.",
                         plan.describe()
                     ));
                     *me2.flavor.borrow_mut() = flavor;
                     *me2.plan.borrow_mut() = Some(plan);
+                    Self::static_fill_editions(&me2, &editions);
                     me2.probe.set(ProbeState::Done);
                     Self::static_update_dynamic_rows(&me2);
                     Self::static_update_sensitivity(&me2);
@@ -577,6 +606,21 @@ impl Window {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
+    }
+
+    /// Populate the WTG edition combo with real WIM image names.
+    fn static_fill_editions(me: &Rc<Inner>, editions: &[String]) {
+        if editions.is_empty() {
+            *me.editions.borrow_mut() = Vec::new();
+            me.wtg_edition.set_model(Some(&StringList::new(&["First edition"])));
+            me.wtg_edition.set_selected(0);
+            return;
+        }
+        let items: Vec<&str> = editions.iter().map(String::as_str).collect();
+        me.wtg_edition
+            .set_model(Some(&StringList::new(&items)));
+        me.wtg_edition.set_selected(0);
+        *me.editions.borrow_mut() = editions.to_vec();
     }
 
     /// Show the persistence slider for raw-DD plans with a detected live
@@ -688,9 +732,12 @@ impl Window {
             {
                 // Windows To Go boots UEFI only — force GPT regardless of
                 // the scheme combo; the confirm dialog shows the layout.
+                // Edition combo position i maps to WIM index i+1; without
+                // probed names there is a single "First edition" entry.
                 FlashPlan::WinToGo {
                     image,
-                    wim_index: me.wtg_index.value() as u32,
+                    wim_index: me.wtg_edition.selected() + 1,
+                    persist_mib: me.wtg_persist.value() as u64,
                     scheme: FlashPlanScheme::Gpt,
                     options,
                 }
@@ -799,6 +846,9 @@ impl Window {
                         "\nPersistence: {persistence_mb} MiB (label “{label}”)"
                     ));
                 }
+            }
+            FlashPlan::WinToGo { persist_mib, .. } if *persist_mib > 0 => {
+                body.push_str(&format!("\nStorage partition: {persist_mib} MiB"));
             }
             FlashPlan::WinFat32 { options, .. }
             | FlashPlan::WinUefiNtfs { options, .. }

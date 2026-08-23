@@ -23,14 +23,14 @@ echo BUILD_OK
 
 echo "== [1] loop rig"
 losetup -D >/dev/null 2>&1
-umount /mnt/p1 /mnt/p2 2>/dev/null
+umount /mnt/p1 /mnt/p2 /mnt/p3 2>/dev/null
 rm -rf /root/e2e/wintree /root/e2e/win-wtg.iso /tmp/wtgsys1 /tmp/wtgsys2 /tmp/m5-a.img
-truncate -s 1200M /tmp/m5-a.img   # 512 MiB ESP + NTFS remainder
+truncate -s 2600M /tmp/m5-a.img   # 512 MiB ESP + 1 GiB data (T14) + Windows remainder
 for i in 7; do
   [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i
 done
 losetup /dev/loop7 /tmp/m5-a.img || exit 1
-mkdir -p /mnt/p1 /mnt/p2
+mkdir -p /mnt/p1 /mnt/p2 /mnt/p3
 
 echo "== [T11] fixture: two-edition install.wim + boot files"
 mkdir -p /root/e2e/wintree/sources /root/e2e/wintree/efi/microsoft/boot \
@@ -40,9 +40,11 @@ echo base > /tmp/wtgsys1/Windows/System32/base.dll
 echo one > /tmp/wtgsys1/Windows/edition-one.txt
 echo base > /tmp/wtgsys2/Windows/System32/base.dll
 echo two > /tmp/wtgsys2/Windows/edition-two.txt
-wimcapture /tmp/wtgsys1 /root/e2e/wintree/sources/install.wim --check >>$LOG 2>&1 \
+wimcapture /tmp/wtgsys1 /root/e2e/wintree/sources/install.wim \
+  "Windows 11 Home" "Home test edition" --check >>$LOG 2>&1 \
   || { echo FIXTURE_FAIL; tail -20 $LOG; exit 1; }
-wimappend /tmp/wtgsys2 /root/e2e/wintree/sources/install.wim --check >>$LOG 2>&1 \
+wimappend /tmp/wtgsys2 /root/e2e/wintree/sources/install.wim \
+  "Windows 11 Pro" --check >>$LOG 2>&1 \
   || { echo FIXTURE_FAIL; tail -20 $LOG; exit 1; }
 echo fake-loader >/root/e2e/wintree/efi/microsoft/boot/bootmgfw.efi
 echo x >/root/e2e/wintree/efi/boot/bootx64.efi
@@ -50,11 +52,17 @@ xorriso -as mkisofs -quiet -U -J -joliet-long -volid FERRUS_WTG \
   -o /root/e2e/win-wtg.iso /root/e2e/wintree >>$LOG 2>&1 || { echo ISO_FAIL; exit 1; }
 echo FIXTURE_OK
 
+echo "== [T11b] edition-name probe (xorriso extract + wimlib info)"
+$EX/flash-dev --list-editions /root/e2e/win-wtg.iso >/tmp/t11b.out 2>&1 \
+  && echo T11B_RUN_OK || { echo T11B_FAIL; cat /tmp/t11b.out; exit 1; }
+grep -q "^1: .*Home" /tmp/t11b.out && echo T11B_ONE_OK || { echo T11B_ONE_BAD; cat /tmp/t11b.out; }
+grep -q "^2: .*Pro"  /tmp/t11b.out && echo T11B_TWO_OK || echo T11B_TWO_BAD
+
 echo "== [T12] WinToGo flash (auto edition, no options)"
 $EX/flash-dev /dev/loop7 /root/e2e/win-wtg.iso --plan wtg --no-verify \
   >/tmp/t12.out 2>&1 && echo T12_FLASH_OK || { echo T12_FAIL; cat /tmp/t12.out; tail -20 $LOG; exit 1; }
 grep -q "Windows To Go ready" /tmp/t12.out && echo T12_MSG_OK || { echo T12_MSG_BAD; cat /tmp/t12.out; }
-partx -a /dev/loop7 >>$LOG 2>&1; sleep 1
+partprobe /dev/loop7 >>$LOG 2>&1; sleep 1
 [ -b /dev/loop7p1 ] && [ -b /dev/loop7p2 ] && echo T12_PARTS_OK || { echo T12_NO_PARTS; sfdisk -d /dev/loop7; exit 1; }
 
 mount /dev/loop7p1 /mnt/p1
@@ -113,6 +121,32 @@ else
   echo T13_UNATTEND_MISSING
 fi
 umount /mnt/p2
+
+echo "== [T14] WinToGo --wtg-persist 1024 (extra data partition)"
+$EX/flash-dev /dev/loop7 /root/e2e/win-wtg.iso --plan wtg --wim-index 1 \
+  --wtg-persist 1024 --no-verify >/tmp/t14.out 2>&1 \
+  && echo T14_FLASH_OK || { echo T14_FAIL; cat /tmp/t14.out; exit 1; }
+grep -q "+1024 MiB data" /tmp/t14.out && echo T14_MSG_OK || { echo T14_MSG_BAD; cat /tmp/t14.out; }
+partprobe /dev/loop7 >>$LOG 2>&1; sleep 1
+[ -b /dev/loop7p2 ] && [ -b /dev/loop7p3 ] \
+  && echo T14_PARTS_OK || { echo T14_NO_PARTS; sfdisk -d /dev/loop7; exit 1; }
+# Layout: p1 ESP 512 MiB, p2 data exactly 1024 MiB (2097152 sectors), p3 Windows.
+sfdisk -d /dev/loop7 2>/dev/null | grep -Eq 'start=.*size= *2097152,' \
+  && echo T14_SIZE_OK || { echo T14_SIZE_BAD; sfdisk -d /dev/loop7; }
+mount -t ntfs-3g /dev/loop7p2 /mnt/p2
+echo persist-test >/mnt/p2/probe.txt
+grep -q persist-test /mnt/p2/probe.txt && echo T14_RW_OK || echo T14_RW_BAD
+rm -f /mnt/p2/probe.txt
+umount /mnt/p2
+sync; sleep 1   # let the FUSE unmount release the node before probing
+if command -v ntfslabel >/dev/null; then
+  L=$(ntfslabel /dev/loop7p2 2>/dev/null | tr -d '\r\n')
+  [ "$L" = "FERRUSDATA" ] && echo T14_LABEL_OK || { echo "T14_LABEL_BAD got=[$L]"; }
+fi
+mount -t ntfs-3g /dev/loop7p3 /mnt/p3
+[ -f /mnt/p3/Windows/System32/base.dll ] && [ ! -e /mnt/p3/FERRUSDATA ] \
+  && echo T14_WIN_ON_P3_OK || { echo T14_WIN_P3_BAD; ls /mnt/p3; }
+umount /mnt/p3
 
 echo "== cleanup"
 losetup -D >/dev/null 2>&1

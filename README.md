@@ -64,8 +64,15 @@ Rust + GTK4 + libadwaita. GPL-3.0-or-later.
     accepted by `bcdedit /store` itself and by systemd's parser rules
   - Answer file lands in `\Windows\Panther\unattend.xml` of the applied
     image (no setup phase), same three bypass switches as install media
-  - GUI: "Windows To Go" switch + WIM edition SpinRow in the Windows group
-    (forces GPT); flash-dev: `--plan wtg [--wim-index N]`
+  - Optional trailing data partition (`--wtg-persist MiB`) for user files
+  - Edition picker reads real image names out of `install.wim`/`install.esd`
+    (`wimlib-imagex info` after an unprivileged `xorriso -osirrox` stream
+    extraction); falls back to a plain selector when tools are missing
+  - GUI: "Windows To Go" switch + named edition combo + storage SpinRow in
+    the Windows group (forces GPT); flash-dev: `--plan wtg [--wim-index N]
+    [--wtg-persist MiB]`, `--list-editions <iso>`
+- [x] CI: GitHub Actions — unit tests + clippy on every push, and on tag
+      pushes an automatic release job building the `.deb` and attaching it
 - [ ] M6+: VHDX-native boot, persistence for WTG, remaining Rufus features
 
 ## Layout
@@ -81,13 +88,14 @@ scripts/               e2e test suites (loop-device rigs)
 
 ### Environment knobs (testing)
 
-| Variable | Effect |
-| --- | --- |
-| `FERRUS_HELPER_PATH` | helper binary location (else sibling of the client exe) |
-| `FERRUS_ALLOW_LOOP=1` | permit loop devices as flash targets (test rigs) |
-| `FERRUS_UEFI_NTFS_IMG` | override path of the uefi:ntfs bootloader image |
-| `FERRUS_WIM_SPLIT_LIMIT` | shrink the WIM split threshold in bytes (tests); also forces 1 MiB `.swm` parts so micro fixtures exercise multi-part splits |
-| `FERRUS_NO_PKEXEC=1` | run the helper directly even when not root |
+| Variable                 | Effect                                                                      |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `FERRUS_HELPER_PATH`     | helper binary location (else sibling of the client exe)                     |
+| `FERRUS_ALLOW_LOOP=1`    | permit loop devices as flash targets (test rigs)                            |
+| `FERRUS_UEFI_NTFS_IMG`   | override path of the uefi:ntfs bootloader image                             |                                                              |
+| `FERRUS_WIM_SPLIT_LIMIT` | shrink the WIM split threshold in bytes (tests);                            |
+                           | also forces 1 MiB `.swm` parts so micro fixtures exercise multi-part splits |
+| `FERRUS_NO_PKEXEC=1`     | run the helper directly even when not root                                  |
 
 ### Headless tools
 

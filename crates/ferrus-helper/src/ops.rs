@@ -90,7 +90,7 @@ fn partition_gpt(dev: &Path, parts: &[PartSpec]) -> anyhow::Result<()> {
     }
     run(
         "sfdisk",
-        &["-q", "--force", &dev.to_string_lossy()],
+        &["-q", "--force", "--wipe=always", &dev.to_string_lossy()],
         Some(&script),
     )
     .context("writing GPT partition table")
@@ -116,7 +116,7 @@ fn partition_mbr(dev: &Path, parts: &[PartSpec]) -> anyhow::Result<()> {
     }
     run(
         "sfdisk",
-        &["-q", "--force", &dev.to_string_lossy()],
+        &["-q", "--force", "--wipe=always", &dev.to_string_lossy()],
         Some(&script),
     )
     .context("writing MBR partition table")
@@ -1122,7 +1122,13 @@ pub fn execute_plan(
             Ok(format!("Windows USB ready (UEFI:NTFS, {})", scheme.describe()))
         }
 
-        FlashPlan::WinToGo { wim_index, scheme, options, .. } => {
+        FlashPlan::WinToGo {
+            wim_index,
+            scheme,
+            options,
+            persist_mib,
+            ..
+        } => {
             if *scheme == PartitionScheme::Mbr {
                 bail!("Windows To Go requires GPT (UEFI boot); pick the GPT scheme");
             }
@@ -1132,20 +1138,35 @@ pub fn execute_plan(
             progress_tick(send, "partitioning");
             wipe_signatures(dev)?;
             // ESP (FAT32) hosts bootmgfw + BCD; the NTFS partition carries
-            // the applied Windows tree and is what actually boots.
+            // the applied Windows tree and is what actually boots; an
+            // optional partition holds user data. The fill-sized WINDOWS
+            // entry must come last so sfdisk gives it whatever remains.
             let mut p_esp = data_part("FERRUS", Some(1_048_576), false); // 512 MiB
             p_esp.mbr_type = "0c";
+            let mut parts = vec![p_esp];
+            if *persist_mib > 0 {
+                let mut p_data = data_part("FERRUSDATA", Some(*persist_mib * 2048), false);
+                p_data.mbr_type = "07";
+                parts.push(p_data);
+            }
             let mut p_win = data_part("WINDOWS", None, false);
             p_win.mbr_type = "07";
-            partition(dev, PartitionScheme::Gpt, &[p_esp, p_win])?;
+            let win_n = parts.len() as u8 + 1;
+            parts.push(p_win);
+            partition(dev, PartitionScheme::Gpt, &parts)?;
             reread_partitions(dev);
             let p_esp_node = part_node(dev, 1);
-            let p_win_node = part_node(dev, 2);
+            let p_win_node = part_node(dev, win_n);
             wait_for_node(&p_esp_node, 10)?;
             wait_for_node(&p_win_node, 10)?;
 
             progress_tick(send, "formatting");
             mkfs_any("FAT32", "FERRUS", &p_esp_node, None)?;
+            if parts.len() > 2 {
+                let node = part_node(dev, 2);
+                wait_for_node(&node, 10)?;
+                mkfs_any("NTFS", "FERRUSDATA", &node, None)?;
+            }
             mkfs_any("NTFS", "WINDOWS", &p_win_node, None)?;
 
             // The BCD device elements reference partitions by their on-disk
@@ -1156,7 +1177,7 @@ pub fn execute_plan(
                 disk_guid,
             };
             let win_ref = ferrus_core::bcd::PartitionRef {
-                partition_guid: gpt_part_guid(dev_file, 2)?,
+                partition_guid: gpt_part_guid(dev_file, win_n)?,
                 disk_guid,
             };
 
@@ -1222,8 +1243,13 @@ pub fn execute_plan(
             tgt.unmount()?;
             iso_mnt.unmount()?;
             sync_dev(dev);
+            let storage = if *persist_mib > 0 {
+                format!(", +{persist_mib} MiB data")
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "Windows To Go ready ({}, entry {entry_guid})",
+                "Windows To Go ready ({}, entry {entry_guid}{storage})",
                 scheme.describe()
             ))
         }

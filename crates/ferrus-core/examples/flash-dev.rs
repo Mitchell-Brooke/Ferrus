@@ -29,6 +29,30 @@ fn main() {
         no_bitlocker: opt_bitlocker,
     };
 
+    // Edition listing: print the install.wim/esd image names and exit.
+    // Must run while take_flag is still the only args borrower.
+    if take_flag("--list-editions") {
+        let iso = match args.first() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                eprintln!("usage: flash-dev --list-editions <image.iso>");
+                std::process::exit(2);
+            }
+        };
+        match ferrus_core::iso::windows_editions(&iso) {
+            list if !list.is_empty() => {
+                for (i, name) in list.iter().enumerate() {
+                    println!("{}: {name}", i + 1);
+                }
+                return;
+            }
+            _ => {
+                eprintln!("no edition names found in {}", iso.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut persistence_mb: u64 = 0;
     if let Some(pos) = args.iter().position(|a| a == "--persist") {
         if pos + 1 < args.len() {
@@ -53,12 +77,21 @@ fn main() {
         }
     }
 
+    let mut wtg_persist: u64 = 0;
+    if let Some(pos) = args.iter().position(|a| a == "--wtg-persist") {
+        if pos + 1 < args.len() {
+            wtg_persist = args.remove(pos + 1).trim().parse().unwrap_or(0);
+            args.remove(pos);
+        }
+    }
+
     let (device, image) = match (args.first(), args.get(1)) {
         (Some(d), Some(i)) => (d.clone(), i.clone()),
         _ => {
             eprintln!(
                 "usage: flash-dev <device> <image> [--no-verify] [--plan raw|fat32|fat32-split|ntfs|wtg]\n\
-                 \x20             [--wim-index N] [--persist MiB] [--opt-hw] [--opt-account] [--opt-bitlocker]"
+                 \x20             [--wim-index N] [--wtg-persist MiB] [--persist MiB] [--opt-hw]\n\
+                 \x20             [--opt-account] [--opt-bitlocker] | --list-editions <image.iso>"
             );
             std::process::exit(2);
         }
@@ -91,6 +124,7 @@ fn main() {
         "wtg" => FlashPlan::WinToGo {
             image: image.clone(),
             wim_index,
+            persist_mib: wtg_persist,
             scheme: Default::default(),
             options: win_options,
         },

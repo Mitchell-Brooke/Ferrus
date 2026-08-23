@@ -30,7 +30,8 @@ install -Dm644 LICENSE "$STAGE/usr/share/doc/ferrus/copyright"
 # ---- control -------------------------------------------------------------
 mkdir -p "$STAGE/DEBIAN"
 KIB=$(du -sk "$STAGE/usr" | cut -f1)
-sed "s/@INSTALLED_SIZE@/$((KIB + 16))/" pack/control > "$STAGE/DEBIAN/control"
+sed -e "s/@INSTALLED_SIZE@/$((KIB + 16))/" -e "s/@VERSION@/$VERSION/" \
+  pack/control > "$STAGE/DEBIAN/control"
 
 # ---- archive (dpkg-deb-free) ---------------------------------------------
 printf '2.0\n' > "$STAGE/debian-binary"
