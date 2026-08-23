@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrus
+GenericName=Bootable USB Creator
+Comment=Create bootable USB drives from ISO and disk images
+Exec=ferrus
+Icon=media-removable-symbolic
+Categories=System;Utility;
+Keywords=usb;iso;boot;flash;image;
+StartupNotify=true
+Terminal=false

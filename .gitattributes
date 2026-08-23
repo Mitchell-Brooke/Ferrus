@@ -1,0 +1,4 @@
+# Normalize to LF everywhere — sources are built/run from WSL/Linux.
+* text=auto eol=lf
+*.png binary
+*.img binary

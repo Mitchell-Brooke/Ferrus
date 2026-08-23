@@ -1,0 +1,16 @@
+Package: ferrus
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.2), policykit-1, util-linux (>= 2.38), dosfstools, ntfs-3g | ntfsprogs, wimtools, e2fsprogs
+Recommends: exfatprogs, udftools
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Ferrus Developers <ferrus@localhost>
+Homepage: https://example.invalid/ferrus
+Description: Bootable USB creation tool for Linux
+ A native Rufus-style utility that writes ISO images and Windows
+ installers to USB drives: raw DD for Linux ISOs, FAT32 layouts with
+ automatic WIM splitting for Windows, UEFI:NTFS for oversized trees,
+ GPT/MBR partition schemes, filesystem/cluster/label control and
+ optional bad-block scanning.

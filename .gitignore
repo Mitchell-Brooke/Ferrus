@@ -1,0 +1,6 @@
+/target
+/target-*/
+*.deb
+__pycache__/
+*.swp
+.tmp-*log.txt

@@ -1,0 +1,17 @@
+[package]
+name = "ferrus-gui"
+description = "Ferrus - bootable USB creator for Linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ferrus"
+path = "src/main.rs"
+
+[dependencies]
+ferrus-core = { path = "../ferrus-core" }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+once_cell = "1"

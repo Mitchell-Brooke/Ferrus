@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrus
+GenericName=Bootable USB Creator
+Comment=Write ISO images and Windows installers to USB drives
+Exec=ferrus
+Icon=drive-removable-media
+Terminal=false
+Categories=System;Utility;HardwareSettings;
+Keywords=usb;iso;boot;flash;writer;rufus;
+StartupNotify=true
