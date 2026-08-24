@@ -28,6 +28,7 @@ static CRC32C_TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new(
 fn crc32c_table() -> &'static [u32; 256] {
     CRC32C_TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..256 {
             let mut c = i as u32;
             for _ in 0..8 {
@@ -89,7 +90,7 @@ pub fn build_fixed_vhdx(
     let payload_len = virtual_size;
 
     // File size: payload + payload_offset, rounded to 1 MB
-    let file_size = (payload_offset + payload_len).div_ceil(MB as u64) * MB as u64;
+    let file_size = (payload_offset + payload_len).div_ceil(MB) * MB;
 
     let mut w = Cursor::new(Vec::with_capacity(file_size as usize));
 
@@ -216,6 +217,7 @@ fn write_fti(w: &mut Cursor<Vec<u8>>, creator: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Header structure (4 KB), stored at 64 KB and 128 KB.
 fn build_header(
     sequence_number: u64,

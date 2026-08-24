@@ -1737,9 +1737,9 @@ fn create_fixed_vhdx(path: &Path, size_mib: u64, cancel: &AtomicBool) -> anyhow:
     // - Footer: last 512 bytes of file
 
     let header_offset = 1024 * 1024; // 1 MiB
-    let region_table_offset = 2 * 1024 * 1024; // 2 MiB
-    let region_table_size = 1024 * 1024; // 1 MiB (one region entry)
-    let data_region_offset = (region_table_offset + region_table_size + 1048575) / 1048576 * 1048576;
+let region_table_offset = 2 * 1024u64 * 1024u64; // 2 MiB
+let region_table_size = 1024u64 * 1024u64; // 1 MiB (one region entry)
+let data_region_offset = (region_table_offset + region_table_size).div_ceil(1048576u64) * 1048576u64;
     let footer_offset = data_region_offset + logical_bytes;
     let file_size = footer_offset + 512;
 
