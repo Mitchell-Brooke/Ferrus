@@ -387,6 +387,7 @@ mod tests {
             image: "/win.iso".into(),
             wim_index: 1,
             vhdx_size_mib: 65536,
+            persist_mib: 0,
             scheme: PartitionScheme::Gpt,
             options: WinOptions::default(),
         };

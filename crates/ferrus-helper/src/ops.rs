@@ -2,7 +2,7 @@
 //! mounting, tree copying and WIM splitting. Every external command failure
 //! carries its stderr so protocol errors stay actionable.
 
-use std::io::{Read, Write, Seek};
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context};
-use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::hash as crc32_hash;
 use ferrus_core::iso::{self, ImageManifest};
 use ferrus_core::protocol::FlashPlan;
@@ -1728,7 +1727,7 @@ fn create_fixed_vhdx(path: &Path, size_mib: u64, cancel: &AtomicBool) -> anyhow:
 
     let logical_bytes = size_mib * 1024 * 1024;
     let sector_size = 512u64;
-    let logical_sectors = logical_bytes / sector_size;
+    let _logical_sectors = logical_bytes / sector_size;
 
     // File layout:
     // - File Type Identifier: 1 MiB at offset 0 (padded with zeros)
@@ -1739,9 +1738,8 @@ fn create_fixed_vhdx(path: &Path, size_mib: u64, cancel: &AtomicBool) -> anyhow:
 
     let header_offset = 1024 * 1024; // 1 MiB
     let region_table_offset = 2 * 1024 * 1024; // 2 MiB
-    let region_table_size = 1 * 1024 * 1024; // 1 MiB (one region entry)
-
-    let data_region_offset = ((region_table_offset + region_table_size) + 1024 * 1024 - 1) / (1024 * 1024) * (1024 * 1024);
+    let region_table_size = 1024 * 1024; // 1 MiB (one region entry)
+    let data_region_offset = (region_table_offset + region_table_size + 1048575) / 1048576 * 1048576;
     let footer_offset = data_region_offset + logical_bytes;
     let file_size = footer_offset + 512;
 
@@ -1869,14 +1867,14 @@ fn create_fixed_vhdx(path: &Path, size_mib: u64, cancel: &AtomicBool) -> anyhow:
     let header_slice = &header_data[header_start..header_start + 1024 * 1024];
     let checksum = crc32_hash(header_slice);
     file.seek(std::io::SeekFrom::Start(checksum_pos))?;
-    file.write_u32::<byteorder::LittleEndian>(checksum)?;
+    file.write_u32::<LittleEndian>(checksum)?;
 
     // Compute and write footer checksum
     let footer_start = footer_offset as usize;
     let footer_data = &header_data[footer_start..footer_start + 512];
     let footer_checksum = crc32_hash(footer_data);
     file.seek(std::io::SeekFrom::Start(footer_checksum_pos))?;
-    file.write_u32::<byteorder::LittleEndian>(footer_checksum)?;
+    file.write_u32::<LittleEndian>(footer_checksum)?;
 
     file.flush()?;
     Ok(())

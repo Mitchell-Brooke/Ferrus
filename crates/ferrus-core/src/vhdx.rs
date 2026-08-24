@@ -68,7 +68,7 @@ pub fn build_fixed_vhdx(
     logical_sector_size: u32,
     physical_sector_size: u32,
 ) -> Result<Vec<u8>> {
-    if payload.len() % 512 != 0 {
+    if !payload.len().is_multiple_of(512) {
         bail!("payload size must be multiple of 512");
     }
     if !block_size.is_power_of_two() || block_size < MB as u32 || block_size > 256 * MB as u32 {
@@ -76,7 +76,7 @@ pub fn build_fixed_vhdx(
     }
 
     let virtual_size = payload.len() as u64;
-    let payload_blocks = (virtual_size + block_size as u64 - 1) / block_size as u64;
+    let _payload_blocks = virtual_size.div_ceil(block_size as u64);
 
     // Layout offsets (all 1 MB aligned)
     let header_sec_offset = KB64;           // 0x10000
@@ -89,7 +89,7 @@ pub fn build_fixed_vhdx(
     let payload_len = virtual_size;
 
     // File size: payload + payload_offset, rounded to 1 MB
-    let file_size = ((payload_offset + payload_len + MB - 1) / MB) * MB;
+    let file_size = (payload_offset + payload_len).div_ceil(MB as u64) * MB as u64;
 
     let mut w = Cursor::new(Vec::with_capacity(file_size as usize));
 
@@ -361,18 +361,18 @@ fn build_metadata_region(
 
     // Now write the 5 entries (32 bytes each)
     let entries = [
-        (file_params_guid, item1_off, item1_len, 0u32 | 0x01 | 0x04), // IsRequired=1 (bit2), IsVirtualDisk=0, IsUser=0
-        (vdsize_guid, item2_off, item2_len, 0u32 | 0x01 | 0x02 | 0x04), // IsVirtualDisk=1 (bit1), IsRequired=1
-        (vdid_guid, item3_off, item3_len, 0u32 | 0x01 | 0x02 | 0x04),
-        (logsec_guid, item4_off, item4_len, 0u32 | 0x01 | 0x02 | 0x04),
-        (physsec_guid, item5_off, item5_len, 0u32 | 0x01 | 0x02 | 0x04),
+        (file_params_guid, item1_off, item1_len, 0x01 | 0x04), // IsRequired=1 (bit2), IsVirtualDisk=0, IsUser=0
+        (vdsize_guid, item2_off, item2_len, 0x01 | 0x02 | 0x04), // IsVirtualDisk=1 (bit1), IsRequired=1
+        (vdid_guid, item3_off, item3_len, 0x01 | 0x02 | 0x04),
+        (logsec_guid, item4_off, item4_len, 0x01 | 0x02 | 0x04),
+        (physsec_guid, item5_off, item5_len, 0x01 | 0x02 | 0x04),
     ];
 
     for (guid, off, len, flags) in entries {
         m.extend_from_slice(&guid);         // ItemID (16)
         m.extend_from_slice(&off.to_le_bytes());  // Offset (4)
         m.extend_from_slice(&len.to_le_bytes());  // Length (4)
-        m.extend_from_slice(&flags.to_le_bytes()); // A|B|C|Reserved (4)
+        m.extend_from_slice(&(flags as u32).to_le_bytes()); // A|B|C|Reserved (4)
         m.extend_from_slice(&[0u8; 4]);     // Reserved2 (4)
         // Total 32 bytes per entry
     }
@@ -394,7 +394,7 @@ fn build_metadata_region(
 
 fn pad_to(w: &mut Cursor<Vec<u8>>, align: u64) -> Result<()> {
     let pos = w.position();
-    let target = ((pos + align - 1) / align) * align;
+    let target = pos.div_ceil(align) * align;
     if target > pos {
         w.write_all(&vec![0u8; (target - pos) as usize])?;
     }
