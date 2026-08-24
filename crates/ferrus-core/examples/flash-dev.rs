@@ -146,6 +146,7 @@ fn main() {
             image: image.clone(),
             wim_index,
             vhdx_size_mib: wtg_vhdx_size,
+            persist_mib: wtg_persist,
             scheme: Default::default(),
             options: win_options,
         },
